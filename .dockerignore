@@ -1,0 +1,7 @@
+.git
+.venv
+.score
+*.tar.gz
+**/__pycache__
+.pytest_cache
+servers/rust/target

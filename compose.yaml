@@ -1,0 +1,62 @@
+# SlopSearch dev stack. Usually driven through the Makefile (`make help`).
+#
+#   opensearch  reference OpenSearch 3.9.0 (full distribution, security off)  :9290
+#   go          SlopSearch, Go implementation                                  :9291
+#   rust        SlopSearch, Rust implementation                                :9292
+#   tests       the compatibility suite (pytest), run on demand
+#
+# Host ports can be changed in .env (OPENSEARCH_PORT, GO_PORT, RUST_PORT).
+name: slopsearch
+
+services:
+  opensearch:
+    image: opensearchproject/opensearch:3.9.0
+    environment:
+      cluster.name: opensearch
+      discovery.type: single-node
+      DISABLE_SECURITY_PLUGIN: "true"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      OPENSEARCH_JAVA_OPTS: -Xms1g -Xmx1g
+    # data in RAM: every cluster-state change is fsynced, which makes index
+    # create/delete several times slower on a disk-backed volume
+    tmpfs:
+      - /usr/share/opensearch/data:uid=1000,gid=1000
+    ports:
+      - "127.0.0.1:${OPENSEARCH_PORT:-9290}:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf 'localhost:9200/_cluster/health?wait_for_status=yellow&timeout=1s' >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 20s
+
+  go:
+    build: servers/go
+    ports:
+      - "127.0.0.1:${GO_PORT:-9291}:9200"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9200/"]
+      interval: 2s
+      retries: 30
+
+  rust:
+    build: servers/rust
+    ports:
+      - "127.0.0.1:${RUST_PORT:-9292}:9200"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9200"]
+      interval: 2s
+      retries: 30
+
+  tests:
+    build:
+      context: .
+      dockerfile: tests/Dockerfile
+    profiles: ["tools"]
+    volumes:
+      - .:/work
+    working_dir: /work
+    environment:
+      OS_PORT: "9200"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

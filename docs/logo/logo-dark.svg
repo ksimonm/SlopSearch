@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 128" width="500" height="128" role="img" aria-label="SlopSearch">
+  <defs>
+    <clipPath id="lens"><circle cx="54" cy="54" r="34"/></clipPath>
+    <linearGradient id="slop" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5BE89E"/>
+      <stop offset="1" stop-color="#16A35A"/>
+    </linearGradient>
+  </defs>
+  <g>
+  <!-- handle -->
+  <line x1="82" y1="82" x2="110" y2="110" stroke="#E6EDF3" stroke-width="15" stroke-linecap="round"/>
+  <!-- glass -->
+  <circle cx="54" cy="54" r="34" fill="#EAF6FF"/>
+  <g clip-path="url(#lens)">
+    <path d="M14 58 C 26 48, 38 68, 54 58 S 80 48, 96 58 V 96 H 14 Z" fill="url(#slop)"/>
+    <path d="M14 58 C 26 48, 38 68, 54 58 S 80 48, 96 58" fill="none" stroke="#9BF5C4" stroke-width="3"/>
+    <circle cx="40" cy="74" r="4" fill="#9BF5C4"/>
+    <circle cx="62" cy="80" r="2.5" fill="#9BF5C4"/>
+    <circle cx="70" cy="70" r="3" fill="#9BF5C4"/>
+  </g>
+  <!-- shine -->
+  <path d="M33 38 A 26 26 0 0 1 52 27" fill="none" stroke="#FFFFFF" stroke-width="5" stroke-linecap="round"/>
+  <!-- rim -->
+  <circle cx="54" cy="54" r="34" fill="none" stroke="#E6EDF3" stroke-width="9"/>
+  <!-- drip -->
+  <path d="M38 88 C 38 96, 30 104, 30 110 a 8 8 0 0 0 16 0 C 46 104, 38 96, 38 88 Z" fill="url(#slop)" stroke="#E6EDF3" stroke-width="3"/>
+  </g>
+  <text x="136" y="86" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="66" font-weight="800" letter-spacing="-1.5"><tspan fill="#16A35A">Slop</tspan><tspan fill="#E6EDF3">Search</tspan></text>
+</svg>

@@ -1,0 +1,14 @@
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule: {interval: monthly}
+  - package-ecosystem: cargo
+    directory: /servers/rust
+    schedule: {interval: monthly}
+  - package-ecosystem: docker
+    directories: [/servers/go, /servers/rust, /tests]
+    schedule: {interval: monthly}
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: {interval: monthly}

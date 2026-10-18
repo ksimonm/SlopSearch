@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# OpenSearch distributions (upstream downloads, ~285 MB)
+*.tar.gz
+
+# Server build artifacts
+servers/rust/target/
+servers/go/slopsearch
+
+
+# Compatibility score reports (scripts/score.py)
+.score/

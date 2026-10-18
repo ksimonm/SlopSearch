@@ -1,0 +1,11 @@
+[package]
+name = "slopsearch"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+serde_json = { version = "1", features = ["arbitrary_precision", "preserve_order"] }
+regex = "1"
+base64 = "0.13"
