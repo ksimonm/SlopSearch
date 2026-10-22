@@ -44,7 +44,7 @@ jobs:
       - name: Summary
         run: |
           { echo "### ${{ matrix.server }}"; echo '```'; cat score.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: score-${{ matrix.server }}
           path: .score/${{ matrix.server }}/
