@@ -8,4 +8,4 @@ axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 serde_json = { version = "1", features = ["arbitrary_precision", "preserve_order"] }
 regex = "1"
-base64 = "0.13"
+base64 = "0.23"
