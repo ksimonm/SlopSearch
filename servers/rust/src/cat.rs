@@ -821,7 +821,10 @@ fn cat_indices(store: &Store, req: &Req, spec: &str) -> (Vec<CatCol>, Vec<CatRow
             values.insert("store.size".into(), Value::Null);
             values.insert("pri.store.size".into(), Value::Null);
         } else {
-            values.insert("docs.count".into(), json!(idx.docs.len().to_string()));
+            values.insert(
+                "docs.count".into(),
+                json!(idx.docs.len().saturating_add(nested_object_count(idx)).to_string()),
+            );
             values.insert("docs.deleted".into(), json!("0"));
             values.insert(
                 "store.size".into(),
@@ -1217,7 +1220,17 @@ fn cat_plugins() -> (Vec<CatCol>, Vec<CatRow>) {
         col("component", &["c"], "component"),
         col("version", &["v"], "version"),
     ];
-    (cols, vec![])
+    let rows = crate::nodes::PLUGIN_NAMES
+        .iter()
+        .map(|name| {
+            let mut values = Map::new();
+            values.insert("name".into(), json!(NODE_NAME));
+            values.insert("component".into(), json!(name));
+            values.insert("version".into(), json!("3.9.0.0"));
+            CatRow { values }
+        })
+        .collect();
+    (cols, rows)
 }
 
 fn cat_pending_tasks() -> (Vec<CatCol>, Vec<CatRow>) {
@@ -1579,4 +1592,40 @@ fn sorted_index_names(store: &Store) -> Vec<String> {
 
 fn glob_match(pattern: &str, value: &str) -> bool {
     crate::resp::glob_match(pattern, value)
+}
+
+fn nested_object_count(idx: &crate::store::Index) -> usize {
+    fn collect(props: &serde_json::Map<String, serde_json::Value>, prefix: &str, out: &mut Vec<String>) {
+        for (name, raw) in props {
+            let Some(def) = raw.as_object() else { continue };
+            let path = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{}.{}", prefix, name)
+            };
+            if def.get("type").and_then(|v| v.as_str()) == Some("nested") {
+                out.push(path.clone());
+            }
+            if let Some(sub) = def.get("properties").and_then(|p| p.as_object()) {
+                collect(sub, &path, out);
+            }
+        }
+    }
+    let mut paths = Vec::new();
+    if let Some(props) = idx.mappings.get("properties").and_then(|p| p.as_object()) {
+        collect(props, "", &mut paths);
+    }
+    let mut total = 0usize;
+    for doc in idx.docs.values() {
+        for p in &paths {
+            if let Some(v) = crate::store::field_value(doc, p) {
+                total += match v {
+                    serde_json::Value::Array(a) => a.len(),
+                    serde_json::Value::Null => 0,
+                    _ => 1,
+                };
+            }
+        }
+    }
+    total
 }

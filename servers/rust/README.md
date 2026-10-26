@@ -42,11 +42,11 @@ To see what OpenSearch really answers for a request, run it against the referenc
 
 ## Status
 
-64.5% of the suite passes (see the table in the [main README](../../README.md#status)).
-The weakest areas are text analysis (`_analyze`, analyzers, token filters — `test_51`,
-`test_80`), Painless scripting (`test_43`) and the rarer query and field types
-(`test_31`, `test_32`, `test_71`); `make rust-score` shows where to start. The build
-still has dead-code warnings; cleaning them up is welcome.
+81.1% of the suite passes (see the table in the [main README](../../README.md#status)),
+and every test file passes in full except three: text analysis (`test_51`, 6%),
+languages (`test_80`, 40%) and Painless scripting (`test_43`, 29%). All remaining
+failures are in those files; `make rust-test ARGS=tests/test_51_analysis.py` is the place
+to start. The build still has many warnings; cleaning them up is welcome.
 
 ## Rules
 

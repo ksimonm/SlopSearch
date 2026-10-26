@@ -33,7 +33,7 @@ fn values_of(v: Option<&Value>) -> Vec<Value> {
     }
 }
 
-fn doc_field_values(doc: &Value, field: &str, prefix: &str) -> Vec<Value> {
+fn doc_field_values(idx: &Index, doc: &Value, field: &str, prefix: &str) -> Vec<Value> {
     if let Some(n) = doc.get("__nest").and_then(|v| v.as_object()) {
         let p0 = n.get("path").and_then(|v| v.as_str()).unwrap_or("");
         let elem = n.get("elem").cloned().unwrap_or(Value::Null);
@@ -46,17 +46,157 @@ fn doc_field_values(doc: &Value, field: &str, prefix: &str) -> Vec<Value> {
         }
         return vec![];
     }
-    let rf = resolve_field(field, prefix);
+    let base = resolve_field(field, prefix);
+    let rf = crate::eval::resolve_alias_field(idx, &base);
     if is_under_nested_path(&rf) {
         return vec![];
     }
-    values_of(agg_field_value(doc, field, prefix))
+    if crate::eval::mapping_field_def(idx, &rf).is_none() {
+        let dyn_off = match idx.mappings.get("dynamic") {
+            Some(Value::Bool(false)) => true,
+            Some(Value::String(s)) => s == "false" || s == "false_allow_templates",
+            _ => false,
+        };
+        if dyn_off {
+            return vec![];
+        }
+    }
+    let mut vals = if rf != base {
+        values_of(agg_field_value(doc, &rf, ""))
+    } else {
+        values_of(agg_field_value(doc, field, prefix))
+    };
+    if vals.is_empty() {
+        let same_doc = |id: &str| {
+            let Some(orig) = idx.docs.get(id) else {
+                return false;
+            };
+            let mut d = doc.clone();
+            if orig.get("_id").is_none() {
+                if let Some(m) = d.as_object_mut() {
+                    m.remove("_id");
+                }
+            }
+            &d == orig
+        };
+        let by_id = doc
+            .get("_id")
+            .and_then(|v| v.as_str())
+            .filter(|id| same_doc(id))
+            .and_then(|id| idx.doc_values.get(id));
+        let found = by_id.or_else(|| {
+            idx.doc_values
+                .iter()
+                .find(|(id, _)| idx.docs.get(*id).map(|d| d == doc).unwrap_or(false))
+                .map(|(_, dv)| dv)
+        });
+        if let Some(dv) = found {
+            if let Some(raw) = dv.get(&rf) {
+                vals = values_of(Some(raw));
+            }
+        }
+    }
+    if let Some(def) = crate::eval::mapping_field_def(idx, &rf) {
+        if def.get("type").and_then(|v| v.as_str()) == Some("join") {
+            vals = vals
+                .into_iter()
+                .map(|v| match v {
+                    Value::String(s) => Value::String(s),
+                    Value::Object(m) => Value::String(
+                        m.get("name")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    ),
+                    other => other,
+                })
+                .collect();
+        }
+        let ftype = def.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if ftype == "boolean" {
+            vals = vals
+                .into_iter()
+                .map(|v| match v {
+                    Value::Bool(b) => Value::Bool(b),
+                    Value::String(s) => Value::Bool(s == "true"),
+                    Value::Number(n) => Value::Bool(n.as_i64().unwrap_or(0) != 0),
+                    _ => Value::Bool(false),
+                })
+                .collect();
+        }
+        if let Some(ign) = doc.get("_ignored").and_then(|v| v.as_array()) {
+            if ign.iter().any(|x| x.as_str() == Some(rf.as_str())) {
+                vals.clear();
+            }
+        }
+        if matches!(ftype, "keyword" | "constant_keyword" | "wildcard") {
+            if let Some(limit) = def.get("ignore_above").and_then(|v| v.as_i64()) {
+                if limit >= 0 {
+                    vals.retain(|v| match v.as_str() {
+                        Some(s) => s.chars().count() as i64 <= limit,
+                        None => true,
+                    });
+                }
+            }
+        }
+        if ftype == "ip" {
+            vals = vals
+                .into_iter()
+                .map(|v| match v.as_str().and_then(|s| crate::fields::canonical_ip(s).ok()) {
+                    Some(c) => Value::String(c),
+                    None => v,
+                })
+                .collect();
+        }
+        if ftype == "scaled_float" {
+            if let Some(scale) = def.get("scaling_factor").and_then(to_f64) {
+                if scale != 0.0 {
+                    vals = vals
+                        .into_iter()
+                        .map(|v| match to_f64(&v) {
+                            Some(f) => serde_json::json!((f * scale).round() / scale),
+                            None => v,
+                        })
+                        .collect();
+                }
+            }
+        }
+        if ftype == "text"
+            && def.get("fielddata").and_then(|v| v.as_bool()) == Some(true)
+        {
+            vals = vals
+                .into_iter()
+                .filter_map(|v| v.as_str().map(crate::store::analyze))
+                .flatten()
+                .map(Value::String)
+                .collect();
+        }
+        if let Some(norm) = def.get("normalizer").and_then(|v| v.as_str()) {
+            if !norm.is_empty() {
+                vals = vals
+                    .into_iter()
+                    .map(|v| match v {
+                        Value::String(s) => {
+                            Value::String(crate::fields::apply_normalizer_idx(idx, norm, &s))
+                        }
+                        other => other,
+                    })
+                    .collect();
+            }
+        }
+        if vals.is_empty() && ftype == "constant_keyword" {
+            if let Some(cv) = def.get("value") {
+                vals.push(cv.clone());
+            }
+        }
+    }
+    vals
 }
 
-fn numeric_values(docs: &[&Value], field: &str, prefix: &str) -> Vec<f64> {
+fn numeric_values(idx: &Index, docs: &[&Value], field: &str, prefix: &str) -> Vec<f64> {
     let mut out = vec![];
     for d in docs {
-        for v in doc_field_values(d, field, prefix) {
+        for v in doc_field_values(idx, d, field, prefix) {
             if let Some(f) = to_f64(&v) {
                 out.push(f);
             }
@@ -90,6 +230,41 @@ fn all_live_docs(idx: &Index) -> Vec<Value> {
     out
 }
 
+fn nested_leaf_values(
+    idx: &Index,
+    p0: &str,
+    elem: &Value,
+    prefix: &str,
+    out: &mut Map<String, Value>,
+) {
+    let def = if prefix.is_empty() {
+        crate::eval::mapping_field_def(idx, p0).cloned()
+    } else {
+        crate::eval::mapping_field_def(idx, &format!("{}.{}", p0, prefix)).cloned()
+    };
+    let def = match def {
+        Some(d) => d,
+        None => return,
+    };
+    if let Some(props) = def.get("properties").and_then(|v| v.as_object()) {
+        for (name, _) in props {
+            let rel = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{}.{}", prefix, name)
+            };
+            nested_leaf_values(idx, p0, elem, &rel, out);
+        }
+        return;
+    }
+    let vals = values_of(field_value(elem, prefix));
+    if vals.is_empty() {
+        return;
+    }
+    out.insert(prefix.to_string(), Value::Array(vals.clone()));
+    out.insert(format!("{}.{}", p0, prefix), Value::Array(vals));
+}
+
 fn doc_matches(idx: &Index, doc: &Value, query: &Map<String, Value>) -> bool {
     if let Some(n) = doc.get("__nest").and_then(|v| v.as_object()) {
         let p0 = n
@@ -98,26 +273,18 @@ fn doc_matches(idx: &Index, doc: &Value, query: &Map<String, Value>) -> bool {
             .unwrap_or("")
             .to_string();
         let elem = n.get("elem").cloned().unwrap_or(Value::Null);
-        let em = match elem.as_object() {
-            Some(m) => m,
-            None => return false,
-        };
-        return match crate::fields::doc_values_for(idx, "", em) {
-            Ok((vals, _)) => {
-                let mut vm = Map::new();
-                for (k, v) in vals {
-                    vm.insert(k.clone(), Value::Array(v.clone()));
-                    if !p0.is_empty() {
-                        vm.insert(format!("{}.{}", p0, k), Value::Array(v));
-                    }
-                }
-                QueryCtx::with_values(idx, "", &elem, vm)
-                    .eval(query)
-                    .map(|(ok, _)| ok)
-                    .unwrap_or(false)
-            }
-            Err(_) => false,
-        };
+        if elem.as_object().is_none() {
+            return false;
+        }
+        let mut vm = Map::new();
+        nested_leaf_values(idx, &p0, &elem, "", &mut vm);
+        let mut ctx = QueryCtx::with_values(idx, "", &elem, vm);
+        ctx.scope_path = Some(p0);
+        ctx.scope_obj = Some(elem.clone());
+        return ctx
+            .eval(query)
+            .map(|(ok, _)| ok)
+            .unwrap_or(false);
     }
     let m = match doc.as_object() {
         Some(m) => m,
@@ -160,7 +327,8 @@ fn is_mapped_field(idx: &Index, field: &str, prefix: &str) -> bool {
 }
 
 fn field_kind(idx: &Index, field: &str, prefix: &str) -> String {
-    field_type(idx, resolve_field(field, prefix))
+    let resolved = resolve_field(field, prefix);
+    field_type(idx, &crate::eval::resolve_alias_field(idx, &resolved))
 }
 
 #[derive(Clone, PartialEq)]
@@ -922,7 +1090,7 @@ fn eval_one(
         let field = map_str(t, "field");
         let bucket: Vec<&Value> = docs
             .iter()
-            .filter(|d| doc_field_values(d, &field, prefix).is_empty())
+            .filter(|d| doc_field_values(idx, d, &field, prefix).is_empty())
             .copied()
             .collect();
         let mut res = Map::new();
@@ -1025,7 +1193,7 @@ fn eval_one(
                     break;
                 }
                 let mut picked = false;
-                for v in doc_field_values(d, &dv_field, prefix) {
+                for v in doc_field_values(idx, d, &dv_field, prefix) {
                     let k = value_to_string(&v).unwrap_or_default();
                     let c = counts.entry(k).or_insert(0);
                     if *c < max_docs {
@@ -1168,7 +1336,7 @@ fn eval_one(
         return scripted_metric_agg(name, t, docs, idx);
     }
     if let Some(t) = def.get("matrix_stats").and_then(|v| v.as_object()) {
-        return matrix_stats_agg(t, docs, prefix);
+        return matrix_stats_agg(idx, t, docs, prefix);
     }
     if let Some(t) = def.get("percentiles").and_then(|v| v.as_object()) {
         return percentiles_agg(t, name, docs, idx, prefix);
@@ -1889,8 +2057,8 @@ fn metric_num_type_check(idx: &Index, field: &str, prefix: &str, agg: &str) -> R
     if field.is_empty() {
         return Ok(());
     }
-    let resolved = resolve_field(field, prefix);
-    let ft = match idx.field_types.get(resolved) {
+    let resolved = crate::eval::resolve_alias_field(idx, &resolve_field(field, prefix));
+    let ft = match idx.field_types.get(&resolved) {
         Some(f) => f.clone(),
         None => return Ok(()),
     };
@@ -2083,7 +2251,7 @@ fn metric_agg(
         }
         sopt => {
             for d in docs {
-                let vals = doc_field_values(d, &field, prefix);
+                let vals = doc_field_values(idx, d, &field, prefix);
                 if vals.is_empty() {
                     if let Some(m) = &missing {
                         raws.push(m.clone());
@@ -2215,7 +2383,7 @@ fn collect_metric_values(
         }
         sopt => {
             for d in docs {
-                for v in doc_field_values(d, field, prefix) {
+                for v in doc_field_values(idx, d, field, prefix) {
                     match sopt {
                         Some(src) => {
                             let r = run_agg_script(idx, d, src, script_params, Some(&v))?;
@@ -2292,7 +2460,7 @@ fn mvs_values_for_doc(
             }
         }
         _ => {
-            let raw = doc_field_values(d, &field, prefix);
+            let raw = doc_field_values(idx, d, &field, prefix);
             if raw.is_empty() {
                 if let Some(m) = missing {
                     if let Some(f) = wavg_numeric(m, is_date) {
@@ -2315,8 +2483,8 @@ fn weighted_avg_type_check(idx: &Index, field: &str, prefix: &str) -> Result<(),
     if field.is_empty() {
         return Ok(());
     }
-    let resolved = resolve_field(field, prefix);
-    let ft = match idx.field_types.get(resolved) {
+    let resolved = crate::eval::resolve_alias_field(idx, &resolve_field(field, prefix));
+    let ft = match idx.field_types.get(&resolved) {
         Some(f) => f.clone(),
         None => return Ok(()),
     };
@@ -2902,6 +3070,7 @@ fn scripted_metric_agg(
 }
 
 fn matrix_stats_agg(
+    idx: &Index,
     t: &Map<String, Value>,
     docs: &[&Value],
     prefix: &str,
@@ -2921,7 +3090,7 @@ fn matrix_stats_agg(
     'docs: for d in docs {
         let mut vals: Vec<f64> = Vec::with_capacity(k);
         for f in &fields {
-            let raw = doc_field_values(d, f, prefix);
+            let raw = doc_field_values(idx, d, f, prefix);
             let mut num = None;
             for v in &raw {
                 if let Some(x) = to_f64(v) {
@@ -3331,7 +3500,7 @@ fn extended_stats_agg(
         None => 2.0,
     };
     metric_num_type_check(idx, &field, prefix, "extended_stats")?;
-    let vals = numeric_values(docs, &field, prefix);
+    let vals = numeric_values(idx, docs, &field, prefix);
     if vals.is_empty() {
         return Ok(json!({
             "count": 0,
@@ -5031,7 +5200,7 @@ fn significant_agg(
     let terms_of = |d: &Value| -> Vec<(String, Value)> {
         let mut out: Vec<(String, Value)> = vec![];
         let mut seen: HashSet<String> = HashSet::new();
-        for v in doc_field_values(d, &field, prefix) {
+        for v in doc_field_values(idx, d, &field, prefix) {
             if text {
                 if let Some(s) = v.as_str() {
                     for tok in analyze_tokens(s) {
@@ -5132,6 +5301,42 @@ fn terms_agg(
             ));
         }
     }
+    let field = map_str(t, "field");
+    if field == "_ignored" {
+        let reason = "Fielddata is not supported on field [_ignored] of type [_ignored]";
+        let mut e = ApiError::new("search_phase_execution_exception", "all shards failed", 400);
+        let cause = ApiError::new("illegal_argument_exception", reason, 400);
+        e.root_cause = Some(Box::new(cause.clone()));
+        e.caused_by = Some(Box::new(cause));
+        return Err(e);
+    }
+    if !field.is_empty() {
+        if let Some(def) = crate::eval::mapping_field_def(idx, &field) {
+            if def.get("type").and_then(|v| v.as_str()) == Some("search_as_you_type") {
+                let reason = format!(
+                    "Fielddata is not supported on field [{}] of type [search_as_you_type]",
+                    field
+                );
+                let mut e = ApiError::new("search_phase_execution_exception", "all shards failed", 400);
+                let cause = ApiError::new("illegal_argument_exception", &reason, 400);
+                e.root_cause = Some(Box::new(cause.clone()));
+                e.caused_by = Some(Box::new(cause));
+                return Err(e);
+            }
+            if def.get("doc_values").and_then(|v| v.as_bool()) == Some(false) {
+                let ftype = def.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                let reason = format!(
+                    "Can't load fielddata on [{}] because fielddata is unsupported on fields of type [{}]. Use doc values instead.",
+                    field, ftype
+                );
+                let mut e = ApiError::new("search_phase_execution_exception", "all shards failed", 400);
+                let cause = ApiError::new("illegal_argument_exception", &reason, 400);
+                e.root_cause = Some(Box::new(cause.clone()));
+                e.caused_by = Some(Box::new(cause));
+                return Err(e);
+            }
+        }
+    }
     if let Some(hint) = t.get("execution_hint").and_then(|v| v.as_str()) {
         if hint != "map" && hint != "global_ordinals" {
             return Err(ApiError::new(
@@ -5154,17 +5359,25 @@ fn terms_agg(
         }
     }
     let field = map_str(t, "field");
-    let resolved = resolve_field(&field, prefix);
-    if let Some(ft) = idx.field_types.get(resolved) {
-        if ft == "text" {
-            return Err(ApiError::new(
-                "illegal_argument_exception",
-                &format!(
-                    "Text fields are not optimised for operations that require per-document field data like aggregations and sorting, so these operations are disabled by default. Please use a keyword field instead. Alternatively, set fielddata=true on [{}] in order to load field data by uninverting the inverted index. Note that this can use significant memory.",
-                    field
-                ),
-                400,
-            ));
+    let resolved = crate::eval::resolve_alias_field(idx, &resolve_field(&field, prefix));
+    if let Some(ft) = idx.field_types.get(&resolved) {
+        let fd = crate::eval::mapping_field_def(idx, &resolved)
+            .and_then(|d| d.get("fielddata"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if ft == "text" && !fd {
+            return Err(search_phase_illegal(&format!(
+                "Text fields are not optimised for operations that require per-document field data like aggregations and sorting, so these operations are disabled by default. Please use a keyword field instead. Alternatively, set fielddata=true on [{}] in order to load field data by uninverting the inverted index. Note that this can use significant memory.",
+                field
+            )));
+        }
+    }
+    if let Some(ft) = idx.field_types.get(&resolved) {
+        if ft.ends_with("_range") {
+            return Err(search_phase_illegal(&format!(
+                "Field [{}] of type [{}] is not supported for aggregation [terms]",
+                field, ft
+            )));
         }
     }
     let size = t.get("size").and_then(to_f64).map(|f| f as usize).unwrap_or(10);
@@ -5279,7 +5492,7 @@ fn terms_agg(
                 other => vec![Value::String(key_string(&other))],
             }
         } else {
-            let vals = doc_field_values(d, &field, prefix);
+            let vals = doc_field_values(idx, d, &field, prefix);
             let mut eff: Vec<Value> = vals;
             if eff.is_empty() {
                 if let Some(m) = &missing {
@@ -5314,7 +5527,7 @@ fn terms_agg(
     }
     if min_doc_count == 0 && is_mapped_field(idx, &field, prefix) {
         for d in all_live_docs(idx) {
-            for v in doc_field_values(&d, &field, prefix) {
+            for v in doc_field_values(idx, &d, &field, prefix) {
                 let id = value_to_string(&v).unwrap_or_default();
                 if !buckets.contains_key(&id) {
                     let b = make_bucket(&v);
@@ -5641,7 +5854,7 @@ fn multi_terms_agg(
             };
             let field = map_str(sm, "field");
             let missing = sm.get("missing").cloned();
-            let mut vals = doc_field_values(d, &field, prefix);
+            let mut vals = doc_field_values(idx, d, &field, prefix);
             if vals.is_empty() {
                 match missing {
                     Some(m) => vals.push(m),
@@ -5796,7 +6009,7 @@ fn rare_terms_agg(
     }
     let mut buckets: HashMap<String, Bucket> = HashMap::new();
     for d in docs {
-        for v in doc_field_values(d, &field, prefix) {
+        for v in doc_field_values(idx, d, &field, prefix) {
             let (key, _kas) = term_key_and_string(idx, &field, prefix, &v, "");
             let id = key_string(&key);
             let e = buckets.entry(id).or_insert_with(|| Bucket {
@@ -5876,9 +6089,8 @@ fn cmp_vals_asc(a: &Value, b: &Value) -> Ordering {
 
 fn order_of(t: &Map<String, Value>) -> (String, bool) {
     if let Some(Value::Object(o)) = t.get("order") {
-        for (k, v) in o {
-            let desc = v.as_str() == Some("desc");
-            return (k.clone(), desc);
+        if let Some((k, v)) = o.iter().next() {
+            return (k.clone(), v.as_str() == Some("desc"));
         }
     }
     ("_key".to_string(), false)
@@ -6108,7 +6320,7 @@ fn variable_width_histogram(
     let mut vals: Vec<(f64, usize)> = vec![];
     for (di, d) in docs.iter().enumerate() {
         let mut prev: Option<f64> = None;
-        for v in doc_field_values(d, &field, prefix) {
+        for v in doc_field_values(idx, d, &field, prefix) {
             if let Some(x) = to_f64(&v) {
                 if prev.map(|p| p == x).unwrap_or(false) {
                     continue;
@@ -6293,7 +6505,7 @@ fn histogram_agg(
     let mut counts: HashMap<i64, Vec<&Value>> = HashMap::new();
     for d in docs {
         let mut vals: Vec<f64> = vec![];
-        for v in doc_field_values(d, &field, prefix) {
+        for v in doc_field_values(idx, d, &field, prefix) {
             if let Some(x) = to_f64(&v) {
                 vals.push(x);
             }
@@ -6626,7 +6838,7 @@ fn date_histogram(
     let mut counts: HashMap<i64, Vec<&Value>> = HashMap::new();
     for d in docs {
         let mut vals: Vec<i64> = vec![];
-        for v in doc_field_values(d, &field, prefix) {
+        for v in doc_field_values(idx, d, &field, prefix) {
             let ms = if numeric_mode {
                 to_f64(&v).map(|f| f as i64)
             } else {
@@ -6886,7 +7098,7 @@ fn auto_date_histogram(
     let mut values: Vec<i64> = vec![];
     let mut pairs: Vec<(i64, &Value)> = vec![];
     for d in docs {
-        for v in doc_field_values(d, &field, prefix) {
+        for v in doc_field_values(idx, d, &field, prefix) {
             if let Some(ms) = date_ms_of(&v) {
                 values.push(ms);
                 pairs.push((ms, d));
@@ -7026,7 +7238,7 @@ fn range_agg(
         });
     }
     for d in docs {
-        let mut vals: Vec<f64> = doc_field_values(d, &field, prefix)
+        let mut vals: Vec<f64> = doc_field_values(idx, d, &field, prefix)
             .iter()
             .filter_map(to_f64)
             .collect();
@@ -7196,7 +7408,7 @@ fn date_range_agg(
         });
     }
     for d in docs {
-        for v in doc_field_values(d, &field, prefix) {
+        for v in doc_field_values(idx, d, &field, prefix) {
             if let Some(ms) = date_ms_of(&v) {
                 for b in parsed.iter_mut() {
                     let ok_from = b.from.map(|f| ms >= f).unwrap_or(true);
@@ -7400,18 +7612,30 @@ fn ip_range_agg(
     }
     const V6_OFF: u128 = 1u128 << 32;
     for d in docs {
-        for v in doc_field_values(d, &field, prefix) {
+        for v in doc_field_values(idx, d, &field, prefix) {
             let raw = value_to_string(&v).unwrap_or_default();
             let ipv = match ip_numeric(&raw) {
                 Some(x) => x,
                 None => continue,
             };
             let num = if ipv.1 { ipv.0 + V6_OFF } else { ipv.0 };
+            let mapped_num = if ipv.1 { ipv.0 } else { ipv.0 + V6_OFF };
             for b in parsed.iter_mut() {
-                let bf = b.from.map(|f| if b.v6 { f + V6_OFF } else { f });
-                let bt = b.to.map(|tt| if b.v6 { tt + V6_OFF } else { tt });
-                let ok_from = bf.map(|f| num >= f).unwrap_or(true);
-                let ok_to = bt.map(|tt| num < tt).unwrap_or(true);
+                let (num_cmp, bf, bt) = if b.from.is_none() && b.to.is_some() && !b.v6 {
+                    (
+                        mapped_num,
+                        b.from.map(|f| f + V6_OFF),
+                        b.to.map(|tt| tt + V6_OFF),
+                    )
+                } else {
+                    (
+                        num,
+                        b.from.map(|f| if b.v6 { f + V6_OFF } else { f }),
+                        b.to.map(|tt| if b.v6 { tt + V6_OFF } else { tt }),
+                    )
+                };
+                let ok_from = bf.map(|f| num_cmp >= f).unwrap_or(true);
+                let ok_to = bt.map(|tt| num_cmp < tt).unwrap_or(true);
                 if ok_from && ok_to {
                     b.docs.push(Value::clone(d));
                 }
@@ -7876,7 +8100,7 @@ fn composite_agg(
                     vals.push((CompVal::Str(ks.clone()), Value::String(ks)));
                 }
             } else if s.kind == 0 {
-                for v in doc_field_values(d, &s.field, prefix) {
+                for v in doc_field_values(idx, d, &s.field, prefix) {
                     let (k, _) = term_key_and_string(idx, &s.field, prefix, &v, "");
                     let (cv, kj) = match &k {
                         Value::Number(n) => (
@@ -7893,14 +8117,14 @@ fn composite_agg(
                     vals.push((cv, kj));
                 }
             } else if s.kind == 1 {
-                for v in doc_field_values(d, &s.field, prefix) {
+                for v in doc_field_values(idx, d, &s.field, prefix) {
                     if let Some(x) = to_f64(&v) {
                         let b = (x / s.interval).floor() * s.interval;
                         vals.push((CompVal::Num(b), json_num(b)));
                     }
                 }
             } else {
-                for v in doc_field_values(d, &s.field, prefix) {
+                for v in doc_field_values(idx, d, &s.field, prefix) {
                     if let Some(ms) = date_ms_of(&v) {
                         let b = tz_bucket_start(ms, s.fixed, s.cal, &s.tz);
                         let kj = if s.format.is_empty() {
@@ -8274,7 +8498,7 @@ fn geohash_grid_agg(
     let mut buckets: HashMap<String, Vec<Value>> = HashMap::new();
     let mut order: Vec<String> = vec![];
     for d in docs {
-        for v in doc_field_values(d, &field, prefix) {
+        for v in doc_field_values(idx, d, &field, prefix) {
             if let Some((lat, lon)) = geo_point_of(&v) {
                 let gh = geohash_encode(lat, lon, precision as usize);
                 if !buckets.contains_key(&gh) {
@@ -8333,7 +8557,7 @@ fn geotile_grid_agg(
     let mut buckets: HashMap<String, Vec<Value>> = HashMap::new();
     let mut order: Vec<String> = vec![];
     for d in docs {
-        for v in doc_field_values(d, &field, prefix) {
+        for v in doc_field_values(idx, d, &field, prefix) {
             if let Some((lat, lon)) = geo_point_of(&v) {
                 let n = 1i64 << precision;
                 let mut x = (((lon + 180.0) / 360.0) * n as f64).floor() as i64;
@@ -8450,7 +8674,7 @@ fn geo_distance_agg(
         });
     }
     for d in docs {
-        for v in doc_field_values(d, &field, prefix) {
+        for v in doc_field_values(idx, d, &field, prefix) {
             let (lat, lon) = match geo_point_of(&v) {
                 Some(p) => p,
                 None => continue,

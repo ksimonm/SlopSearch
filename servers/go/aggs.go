@@ -45,7 +45,7 @@ func aggDocs(hits []aggHit) []map[string]any {
 	return out
 }
 
-func evalAggs(aggs map[string]any, hits []aggHit, idx *Index, pathPrefix string) (map[string]any, *apiError) {
+func evalAggs(aggs map[string]any, hits []aggHit, idx *Index, pathPrefix string, typed bool) (map[string]any, *apiError) {
 	docs := aggDocs(hits)
 	out := map[string]any{}
 	for name, raw := range aggs {
@@ -53,13 +53,66 @@ func evalAggs(aggs map[string]any, hits []aggHit, idx *Index, pathPrefix string)
 		if !ok {
 			continue
 		}
-		res, err := evalOneAgg(def, docs, idx, pathPrefix)
+		res, err := evalOneAgg(def, docs, idx, pathPrefix, typed)
 		if err != nil {
 			return nil, err
 		}
-		out[name] = res
+		key := name
+		if typed {
+			if p := typedAggPrefix(def, idx, pathPrefix); p != "" {
+				key = p + "#" + name
+			}
+		}
+		out[key] = res
 	}
 	return out, nil
+}
+
+func typedAggPrefix(def map[string]any, idx *Index, pathPrefix string) string {
+	if t, ok := def["terms"].(map[string]any); ok {
+		field, _ := toString(t["field"])
+		switch fieldType(idx, resolveField(field, pathPrefix)) {
+		case "byte", "short", "integer", "long", "unsigned_long", "date", "date_nanos", "boolean":
+			return "lterms"
+		case "float", "double", "half_float", "scaled_float":
+			return "dterms"
+		}
+		return "sterms"
+	}
+	if t, ok := def["rare_terms"].(map[string]any); ok {
+		field, _ := toString(t["field"])
+		switch fieldType(idx, resolveField(field, pathPrefix)) {
+		case "byte", "short", "integer", "long", "unsigned_long", "date", "date_nanos", "boolean":
+			return "lrareterms"
+		case "float", "double", "half_float", "scaled_float":
+			return "drareterms"
+		}
+		return "srareterms"
+	}
+	prefixes := map[string]string{
+		"significant_terms": "sigsterms", "significant_text": "sigsterms",
+		"multi_terms": "multi_terms", "histogram": "histogram",
+		"date_histogram": "date_histogram", "auto_date_histogram": "auto_date_histogram",
+		"variable_width_histogram": "variable_width_histogram",
+		"range":                    "range", "date_range": "date_range", "ip_range": "ip_range",
+		"filter": "filter", "filters": "filters", "missing": "missing",
+		"global": "global", "nested": "nested", "composite": "composite",
+		"sampler": "sampler", "diversified_sampler": "sampler",
+		"reverse_nested": "reverse_nested", "adjacency_matrix": "adjacency_matrix",
+		"geohash_grid": "geohash_grid", "geotile_grid": "geotile_grid",
+		"geo_distance": "geo_distance", "avg": "avg", "min": "min", "max": "max",
+		"sum": "sum", "stats": "stats", "cardinality": "cardinality",
+		"value_count": "value_count", "percentiles": "percentiles",
+		"percentile_ranks": "percentile_ranks", "extended_stats": "extended_stats",
+		"weighted_avg": "weighted_avg", "top_hits": "top_hits",
+		"scripted_metric": "scripted_metric", "matrix_stats": "matrix_stats",
+	}
+	for k, p := range prefixes {
+		if _, ok := def[k]; ok {
+			return p
+		}
+	}
+	return ""
 }
 
 func subAggsOf(def map[string]any) map[string]any {
@@ -72,28 +125,28 @@ func subAggsOf(def map[string]any) map[string]any {
 	return nil
 }
 
-func evalOneAgg(def map[string]any, docs []map[string]any, idx *Index, pathPrefix string) (any, *apiError) {
+func evalOneAgg(def map[string]any, docs []map[string]any, idx *Index, pathPrefix string, typed bool) (any, *apiError) {
 	if t, ok := def["terms"].(map[string]any); ok {
 		field, _ := toString(t["field"])
-		if fieldType(idx, resolveField(field, pathPrefix)) == "text" {
+		if ft, mapped := idx.FieldTypes[resolveField(field, pathPrefix)]; mapped && ft == "text" {
 			return nil, &apiError{
 				Type: "illegal_argument_exception", Status: 400,
 				Reason: "Fielddata is disabled on text fields by default. Set fielddata=true on [" + field + "] in order to load field data by uninverting the inverted index.",
 			}
 		}
-		return termsAgg(field, docs, idx, pathPrefix, subAggsOf(def), intField(t, "size", 10))
+		return termsAgg(field, docs, idx, pathPrefix, subAggsOf(def), intField(t, "size", 10), typed)
 	}
 	if t, ok := def["date_histogram"].(map[string]any); ok {
 		field, _ := toString(t["field"])
-		return dateHistogramAgg(field, docs, idx, pathPrefix, subAggsOf(def))
+		return dateHistogramAgg(field, docs, idx, pathPrefix, subAggsOf(def), typed)
 	}
 	if t, ok := def["range"].(map[string]any); ok {
 		field, _ := toString(t["field"])
-		return rangeAgg(field, t["ranges"], docs, idx, pathPrefix, subAggsOf(def))
+		return rangeAgg(field, t["ranges"], docs, idx, pathPrefix, subAggsOf(def), typed)
 	}
 	if t, ok := def["nested"].(map[string]any); ok {
 		path, _ := toString(t["path"])
-		return nestedAgg(path, docs, idx, subAggsOf(def))
+		return nestedAgg(path, docs, idx, subAggsOf(def), typed)
 	}
 	if t, ok := def["avg"].(map[string]any); ok {
 		field, _ := toString(t["field"])
@@ -143,7 +196,7 @@ func evalOneAgg(def map[string]any, docs []map[string]any, idx *Index, pathPrefi
 	return map[string]any{}, nil
 }
 
-func termsAgg(field string, docs []map[string]any, idx *Index, pathPrefix string, sub map[string]any, size int) (any, *apiError) {
+func termsAgg(field string, docs []map[string]any, idx *Index, pathPrefix string, sub map[string]any, size int, typed bool) (any, *apiError) {
 	counts := map[string]int{}
 	group := map[string][]map[string]any{}
 	keys := []string{}
@@ -175,7 +228,7 @@ func termsAgg(field string, docs []map[string]any, idx *Index, pathPrefix string
 	for _, k := range keys {
 		b := map[string]any{"key": k, "doc_count": counts[k]}
 		if sub != nil {
-			subRes, err := evalAggs(sub, docsToHits(group[k], idx), idx, pathPrefix)
+			subRes, err := evalAggs(sub, docsToHits(group[k], idx), idx, pathPrefix, typed)
 			if err != nil {
 				return nil, err
 			}
@@ -188,7 +241,7 @@ func termsAgg(field string, docs []map[string]any, idx *Index, pathPrefix string
 	return map[string]any{"doc_count_error_upper_bound": 0, "sum_other_doc_count": 0, "buckets": buckets}, nil
 }
 
-func dateHistogramAgg(field string, docs []map[string]any, idx *Index, pathPrefix string, sub map[string]any) (any, *apiError) {
+func dateHistogramAgg(field string, docs []map[string]any, idx *Index, pathPrefix string, sub map[string]any, typed bool) (any, *apiError) {
 	counts := map[string]int{}
 	group := map[string][]map[string]any{}
 	keys := []string{}
@@ -222,7 +275,7 @@ func dateHistogramAgg(field string, docs []map[string]any, idx *Index, pathPrefi
 			"doc_count":     counts[k],
 		}
 		if sub != nil {
-			subRes, err := evalAggs(sub, docsToHits(group[k], idx), idx, pathPrefix)
+			subRes, err := evalAggs(sub, docsToHits(group[k], idx), idx, pathPrefix, typed)
 			if err != nil {
 				return nil, err
 			}
@@ -235,7 +288,7 @@ func dateHistogramAgg(field string, docs []map[string]any, idx *Index, pathPrefi
 	return map[string]any{"buckets": buckets}, nil
 }
 
-func rangeAgg(field string, rangesRaw any, docs []map[string]any, idx *Index, pathPrefix string, sub map[string]any) (any, *apiError) {
+func rangeAgg(field string, rangesRaw any, docs []map[string]any, idx *Index, pathPrefix string, sub map[string]any, typed bool) (any, *apiError) {
 	ranges, ok := rangesRaw.([]any)
 	if !ok {
 		return nil, errParsing("range requires ranges")
@@ -274,7 +327,7 @@ func rangeAgg(field string, rangesRaw any, docs []map[string]any, idx *Index, pa
 			b["to"] = to
 		}
 		if sub != nil {
-			subRes, err := evalAggs(sub, docsToHits(bucketDocs, idx), idx, pathPrefix)
+			subRes, err := evalAggs(sub, docsToHits(bucketDocs, idx), idx, pathPrefix, typed)
 			if err != nil {
 				return nil, err
 			}
@@ -287,7 +340,7 @@ func rangeAgg(field string, rangesRaw any, docs []map[string]any, idx *Index, pa
 	return map[string]any{"buckets": buckets}, nil
 }
 
-func nestedAgg(path string, docs []map[string]any, idx *Index, sub map[string]any) (any, *apiError) {
+func nestedAgg(path string, docs []map[string]any, idx *Index, sub map[string]any, typed bool) (any, *apiError) {
 	var elements []map[string]any
 	for _, d := range docs {
 		v, ok := fieldValue(d, path)
@@ -307,7 +360,7 @@ func nestedAgg(path string, docs []map[string]any, idx *Index, sub map[string]an
 	}
 	res := map[string]any{"doc_count": len(elements)}
 	if sub != nil {
-		subRes, err := evalAggs(sub, docsToHits(elements, idx), idx, path)
+		subRes, err := evalAggs(sub, docsToHits(elements, idx), idx, path, typed)
 		if err != nil {
 			return nil, err
 		}

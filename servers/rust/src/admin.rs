@@ -13,6 +13,48 @@ use crate::store::{now_millis, random_uuid, settings_value_string, Index, Store}
 use crate::templates::{compose_for_index, merge_mappings_deep};
 use crate::Req;
 
+fn validate_normalizers(
+    props: &Map<String, Value>,
+    settings: &Map<String, Value>,
+) -> Result<(), ApiError> {
+    fn walk(
+        props: &Map<String, Value>,
+        settings: &Map<String, Value>,
+    ) -> Result<(), ApiError> {
+        for (name, raw) in props {
+            let Some(def) = raw.as_object() else { continue };
+            if let Some(norm) = def.get("normalizer").and_then(|v| v.as_str()) {
+                if !norm.is_empty() {
+                    let key = format!("index.analysis.normalizer.{}.type", norm);
+                    let defined = settings.contains_key(&key)
+                        || settings.contains_key(&format!("analysis.normalizer.{}.type", norm))
+                        || crate::store::find_setting(settings, &format!("analysis.normalizer.{}", norm)).is_some();
+                    if norm != "lowercase" && !defined {
+                        let reason = format!(
+                            "normalizer [{}] not found for field [{}]",
+                            norm, name
+                        );
+                        return Err(crate::fields::mapper_err(
+                            "mapper_parsing_exception",
+                            &format!("Failed to parse mapping [_doc]: {}", reason),
+                            "mapper_parsing_exception",
+                            &reason,
+                        ));
+                    }
+                }
+            }
+            if let Some(sub) = def.get("properties").and_then(|p| p.as_object()) {
+                walk(sub, settings)?;
+            }
+            if let Some(fields) = def.get("fields").and_then(|f| f.as_object()) {
+                walk(fields, settings)?;
+            }
+        }
+        Ok(())
+    }
+    walk(props, settings)
+}
+
 fn read_body_map(req: &Req) -> Result<Map<String, Value>, ApiError> {
     let s = String::from_utf8_lossy(&req.body);
     if s.trim().is_empty() {
@@ -155,7 +197,44 @@ pub fn create_index_internal(
     if let Some(mappings_raw) = body.get("mappings").and_then(|m| m.as_object()) {
         merge_mappings_deep(&mut merged_mappings, mappings_raw);
     }
+    if let Some(props) = merged_mappings.get_mut("properties").and_then(|p| p.as_object_mut()) {
+        crate::shared::expand_mapping_properties(props)?;
+        crate::shared::apply_mapper_defaults(props);
+    }
     validate_mapping_full(&Value::Object(merged_mappings.clone()))?;
+    if let Some(props) = merged_mappings.get("properties").and_then(|p| p.as_object()) {
+        validate_normalizers(props, &canonical)?;
+    }
+    let name_limit = crate::store::setting_int(&canonical, "mapping.field_name_length.limit")
+        .unwrap_or(512);
+    for meta in ["_ignored", "_data_stream_timestamp"] {
+        if meta.len() > name_limit as usize {
+            return Err(ApiError::bad(&format!(
+                "Field name [{}] is longer than the limit of [{}] characters",
+                meta, name_limit
+            )));
+        }
+    }
+    let field_limit = crate::store::setting_int(&canonical, "mapping.total_fields.limit")
+        .unwrap_or(1000);
+    if crate::shared::count_mapped_fields(&Value::Object(merged_mappings.clone())) as i64
+        > field_limit
+    {
+        return Err(ApiError::bad(&format!(
+            "Limit of total fields [{}] has been exceeded",
+            field_limit
+        )));
+    }
+    let nested_limit = crate::store::setting_int(&canonical, "mapping.nested_fields.limit")
+        .unwrap_or(50);
+    if crate::shared::count_nested_fields(&Value::Object(merged_mappings.clone())) as i64
+        > nested_limit
+    {
+        return Err(ApiError::bad(&format!(
+            "Limit of nested fields [{}] has been exceeded",
+            nested_limit
+        )));
+    }
 
     let mut aliases: Map<String, Value> = Map::new();
     let mut add_alias = |store: &Store,
@@ -404,6 +483,34 @@ fn field_mappings(idx: &Index, spec: &str, include_defaults: bool) -> Value {
     Value::Object(result)
 }
 
+fn normalize_mapping_view(v: &mut Value) {
+    match v {
+        Value::Object(m) => {
+            if let Some(Value::Bool(b)) = m.get("dynamic").cloned() {
+                m.insert("dynamic".to_string(), Value::String(b.to_string()));
+            }
+            if let Some(Value::Object(derived)) = m.get_mut("derived") {
+                for def in derived.values_mut() {
+                    if let Some(Value::Object(script)) = def.get_mut("script") {
+                        if script.contains_key("source") && !script.contains_key("lang") {
+                            script.insert("lang".to_string(), json!("painless"));
+                        }
+                    }
+                }
+            }
+            for val in m.values_mut() {
+                normalize_mapping_view(val);
+            }
+        }
+        Value::Array(a) => {
+            for val in a {
+                normalize_mapping_view(val);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub fn get_mapping_api(store: &mut Store, req: &Req, spec: &str, fields: &str) -> Response {
     let o = parse_resolve_params(req, ResolveOpts2::default());
     let names = match crate::shared::resolve_spec2(store, spec, &o) {
@@ -418,9 +525,11 @@ pub fn get_mapping_api(store: &mut Store, req: &Req, spec: &str, fields: &str) -
             return err_response(err);
         }
         if fields.is_empty() {
+            let mut view = idx.mappings.clone();
+            normalize_mapping_view(&mut view);
             out.insert(
                 idx.name.clone(),
-                json!({"mappings": idx.mappings.clone()}),
+                json!({"mappings": view}),
             );
         } else {
             out.insert(
@@ -467,6 +576,9 @@ pub fn put_mapping_api(store: &mut Store, req: &Req, spec: &str) -> Response {
     }
     if let Some(props) = body.get("properties").and_then(|p| p.as_object()) {
         if let Err(e) = crate::shared::validate_mapping_full(&json!({"properties": props})) {
+            if e.typ == "illegal_argument_exception" || e.reason.starts_with("Invalid [path]") {
+                return err_response(e);
+            }
             let reason = e
                 .caused_by
                 .as_ref()
@@ -474,7 +586,7 @@ pub fn put_mapping_api(store: &mut Store, req: &Req, spec: &str) -> Response {
                 .unwrap_or_else(|| e.reason.clone());
             let mut err = ApiError::new(
                 "mapper_parsing_exception",
-                &format!("Failed to parse mapping [_doc]: {}", reason),
+                &reason,
                 400,
             );
             err.caused_by = Some(Box::new(ApiError::new(
@@ -492,6 +604,11 @@ pub fn put_mapping_api(store: &mut Store, req: &Req, spec: &str) -> Response {
         }
     }
     for name in &names {
+        if let Some(props) = body.get("properties").and_then(|p| p.as_object()) {
+            if let Err(e) = validate_normalizers(props, &store.indices[name].settings) {
+                return err_response(e);
+            }
+        }
         let idx = store.indices.get_mut(name).unwrap();
         if idx.mappings.get("properties").and_then(|p| p.as_object()).is_none() {
             idx.mappings
@@ -500,12 +617,16 @@ pub fn put_mapping_api(store: &mut Store, req: &Req, spec: &str) -> Response {
                 .insert("properties".to_string(), Value::Object(Map::new()));
         }
         if let Some(props) = body.get("properties").and_then(|p| p.as_object()) {
+            let mut expanded = props.clone();
+            if let Err(e) = crate::shared::expand_mapping_properties(&mut expanded) {
+                return err_response(e);
+            }
             let existing = idx
                 .mappings
                 .get_mut("properties")
                 .and_then(|p| p.as_object_mut())
                 .unwrap();
-            if let Err(e) = merge_mapping_checked(existing, props) {
+            if let Err(e) = merge_mapping_checked(existing, &expanded) {
                 return err_response(e);
             }
         }
@@ -515,6 +636,40 @@ pub fn put_mapping_api(store: &mut Store, req: &Req, spec: &str) -> Response {
                 .unwrap()
                 .insert("dynamic".to_string(), d.clone());
         }
+        if let Some(src) = body.get("_source").and_then(|v| v.as_object()) {
+            if src.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
+                let old = idx
+                    .mappings
+                    .get("_source")
+                    .and_then(|s| s.get("enabled"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                if old {
+                    return err_response(ApiError::new(
+                        "mapper_parsing_exception",
+                        "Mapper for [_source] conflicts with existing mapper:\n\tCannot update parameter [enabled] from [true] to [false]",
+                        400,
+                    ));
+                }
+            }
+        }
+        if let Some(rt) = body.get("_routing").and_then(|v| v.as_object()) {
+            if rt.get("required").and_then(|v| v.as_bool()) == Some(true) {
+                let old = idx
+                    .mappings
+                    .get("_routing")
+                    .and_then(|s| s.get("required"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if !old {
+                    return err_response(ApiError::new(
+                        "mapper_parsing_exception",
+                        "Mapper for [_routing] conflicts with existing mapper:\n\tCannot update parameter [required] from [false] to [true]",
+                        400,
+                    ));
+                }
+            }
+        }
         for (k, v) in &body {
             if k == "properties" || k == "dynamic" {
                 continue;
@@ -523,6 +678,29 @@ pub fn put_mapping_api(store: &mut Store, req: &Req, spec: &str) -> Response {
                 .as_object_mut()
                 .unwrap()
                 .insert(k.clone(), v.clone());
+        }
+        if let Some(props) = idx
+            .mappings
+            .get_mut("properties")
+            .and_then(|p| p.as_object_mut())
+        {
+            crate::shared::apply_mapper_defaults(props);
+        }
+        let field_limit = crate::store::setting_int(&idx.settings, "mapping.total_fields.limit")
+            .unwrap_or(1000);
+        if crate::shared::count_mapped_fields(&idx.mappings) as i64 > field_limit {
+            return err_response(ApiError::bad(&format!(
+                "Limit of total fields [{}] has been exceeded",
+                field_limit
+            )));
+        }
+        let nested_limit = crate::store::setting_int(&idx.settings, "mapping.nested_fields.limit")
+            .unwrap_or(50);
+        if crate::shared::count_nested_fields(&idx.mappings) as i64 > nested_limit {
+            return err_response(ApiError::bad(&format!(
+                "Limit of nested fields [{}] has been exceeded",
+                nested_limit
+            )));
         }
         idx.mapping_version += 1;
         idx.ensure_field_types();
@@ -551,8 +729,44 @@ fn merge_mapping_checked(
         };
         let new_type = new_def.get("type").and_then(|t| t.as_str()).unwrap_or("");
         let old_type = old_def.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let old_enabled = old_def.get("enabled").and_then(|v| v.as_bool());
+        let new_enabled = new_def.get("enabled").and_then(|v| v.as_bool());
+        if old_enabled != new_enabled {
+            return Err(ApiError::new(
+                "mapper_exception",
+                &format!(
+                    "the [enabled] parameter can't be updated for the object mapping [{}]",
+                    name
+                ),
+                500,
+            ));
+        }
+        if old_type == "alias" && new_type == "alias" {
+            existing.insert(name.clone(), raw_new.clone());
+            continue;
+        }
+        if old_type == "alias" && new_type != "alias" {
+            return Err(ApiError::bad(&format!(
+                "Cannot merge a field alias mapping [{}] with a mapping that is not for a field alias.",
+                name
+            )));
+        }
         let old_props = old_def.get("properties").and_then(|p| p.as_object());
         let new_props = new_def.get("properties").and_then(|p| p.as_object());
+        if (old_type == "nested" || old_type == "object" || old_props.is_some())
+            && (new_type == "nested" || new_type == "object")
+        {
+            let old_nested = old_type == "nested";
+            let new_nested = new_type == "nested";
+            if old_nested != new_nested {
+                let reason = if new_nested {
+                    "cannot change object mapping from non-nested to nested"
+                } else {
+                    "cannot change object mapping from nested to non-nested"
+                };
+                return Err(ApiError::bad(reason));
+            }
+        }
         if (old_props.is_some() && !new_type.is_empty() && new_props.is_none())
             || (old_props.is_none() && new_props.is_some())
         {
@@ -573,6 +787,21 @@ fn merge_mapping_checked(
                 name, old_type, new_type
             )));
         }
+        if old_type == "text"
+            && new_type == "text"
+            && !new_def.contains_key("analyzer")
+        {
+            let old_analyzer = old_def
+                .get("analyzer")
+                .map(settings_value_string)
+                .unwrap_or_else(|| "default".to_string());
+            if old_analyzer != "default" {
+                return Err(ApiError::bad(&format!(
+                    "Mapper for [{}] conflicts with existing mapper:\n\tCannot update parameter [analyzer] from [{}] to [default]",
+                    name, old_analyzer
+                )));
+            }
+        }
         for (pk, pv) in new_def {
             match pk.as_str() {
                 "type" | "properties" => continue,
@@ -588,6 +817,20 @@ fn merge_mapping_checked(
                         old_clone.get_mut("fields").unwrap().as_object_mut().unwrap();
                     if let Some(new_fields) = pv.as_object() {
                         for (fk, fv) in new_fields {
+                            if let Some(oldt) = old_fields
+                                .get(fk)
+                                .and_then(|d| d.get("type"))
+                                .and_then(|t| t.as_str())
+                            {
+                                if let Some(newt) = fv.get("type").and_then(|t| t.as_str()) {
+                                    if oldt != newt {
+                                        return Err(ApiError::bad(&format!(
+                                            "mapper [{}.{}] cannot be changed from type [{}] to [{}]",
+                                            name, fk, oldt, newt
+                                        )));
+                                    }
+                                }
+                            }
                             old_fields.insert(fk.clone(), fv.clone());
                         }
                     }
@@ -603,6 +846,23 @@ fn merge_mapping_checked(
                             return Err(ApiError::bad(&format!(
                                 "Mapper for [{}] conflicts with existing mapper:\n\tCannot update parameter [analyzer] from [default] to [{}]",
                                 name, pvs
+                            )));
+                        }
+                    }
+                    let default_val = match pk.as_str() {
+                        "index" => Some("true"),
+                        "doc_values" => Some("true"),
+                        "normalizer" => Some("default"),
+                        "null_value" => Some("null"),
+                        "index_options" => Some("positions"),
+                        _ => None,
+                    };
+                    if let Some(dv) = default_val {
+                        let pvs = settings_value_string(pv);
+                        if pvs != dv {
+                            return Err(ApiError::bad(&format!(
+                                "Mapper for [{}] conflicts with existing mapper:\n\tCannot update parameter [{}] from [{}] to [{}]",
+                                name, pk, dv, pvs
                             )));
                         }
                     }

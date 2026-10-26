@@ -114,6 +114,54 @@ fn node_info_base() -> Map<String, Value> {
     .unwrap_or_default()
 }
 
+pub const PLUGIN_NAMES: &[&str] = &[
+    "opensearch-alerting",
+    "opensearch-anomaly-detection",
+    "opensearch-asynchronous-search",
+    "opensearch-cross-cluster-replication",
+    "opensearch-custom-codecs",
+    "opensearch-flow-framework",
+    "opensearch-geospatial",
+    "opensearch-index-management",
+    "opensearch-job-scheduler",
+    "opensearch-knn",
+    "opensearch-ltr",
+    "opensearch-ml",
+    "opensearch-neural-search",
+    "opensearch-notifications",
+    "opensearch-notifications-core",
+    "opensearch-observability",
+    "opensearch-performance-analyzer",
+    "opensearch-reports-scheduler",
+    "opensearch-search-relevance",
+    "opensearch-security",
+    "opensearch-security-analytics",
+    "opensearch-skills",
+    "opensearch-sql",
+    "opensearch-system-templates",
+    "opensearch-ubi",
+    "query-insights",
+];
+
+pub fn plugins_list() -> Vec<Value> {
+    PLUGIN_NAMES
+        .iter()
+        .map(|name| {
+            json!({
+                "name": name,
+                "version": "3.9.0.0",
+                "opensearch_version": NODE_VERSION,
+                "java_version": "25",
+                "description": format!("{} plugin", name),
+                "classname": format!("org.opensearch.plugin.{}", name.replace('-', ".")),
+                "has_native_controller": false,
+                "licensed": false,
+                "type": "plugin",
+            })
+        })
+        .collect()
+}
+
 fn modules_list() -> Vec<Value> {
     MODULE_NAMES
         .iter()
@@ -181,7 +229,7 @@ fn node_info_for_metric(metric: &str) -> Map<String, Value> {
                 "max_content_length_in_bytes": 104857600,
             }
         }),
-        "plugins" => json!({"plugins": [], "modules": modules_list()}),
+        "plugins" => json!({"plugins": plugins_list(), "modules": modules_list()}),
         "ingest" => {
                     let procs: Vec<Value> = crate::ingest::PROCESSOR_TYPES
                         .iter()

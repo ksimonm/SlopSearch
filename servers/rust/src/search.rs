@@ -1,5 +1,5 @@
 use crate::aggs::eval_aggs_root;
-use crate::docs::{parse_q_param, search_alias_filter};
+use crate::docs::{bm25_explanation, parse_q_param, search_alias_filter};
 use crate::errors::{err_response, json_response};
 use crate::eval::{
     as_query_list, integer_of, mapping_field_def, resolve_alias_field, single_entry,
@@ -252,9 +252,14 @@ pub(crate) fn date_parts(ms: i64) -> (i64, i64, i64, i64, i64, i64, i64) {
 
 pub(crate) fn format_epoch_ms(ms: i64) -> String {
     let (y, mo, d, hh, mi, ss, millis) = date_parts(ms);
+    let ys = if y < 0 {
+        format!("-{:04}", -y)
+    } else {
+        format!("{:04}", y)
+    };
     format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-        y, mo, d, hh, mi, ss, millis
+        "{}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        ys, mo, d, hh, mi, ss, millis
     )
 }
 
@@ -288,16 +293,48 @@ pub(crate) fn apply_java_date_format(f: &str, ms: i64) -> Option<String> {
 
 fn format_doc_value(ftype: &str, v: &Value, format: &str) -> Value {
     match ftype {
-        "date" | "date_nanos" => {
-            let mut ms = match integer_of(v) {
+        "date_nanos" => {
+            let Some(ns) = integer_of(v) else {
+                return v.clone();
+            };
+            let ms = ns.div_euclid(1_000_000);
+            if matches!(
+                format,
+                "strict_date_optional_time_nanos" | "date_optional_time_nanos"
+            ) {
+                let (y, mo, d, hh, mi, ss, millis) = date_parts(ms);
+                let nanos = ns.rem_euclid(1_000_000_000);
+                return Value::String(format!(
+                    "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}{:06}Z",
+                    y, mo, d, hh, mi, ss, millis,
+                    nanos % 1_000_000
+                ));
+            }
+            match format {
+                "" | "strict_date_optional_time" | "date_optional_time"
+                | "strict_date_optional_time_nanos" | "date_optional_time_nanos" => {
+                    Value::String(format_epoch_ms(ms))
+                }
+                "epoch_millis" => Value::String(ms.to_string()),
+                "epoch_second" => Value::String((ms / 1000).to_string()),
+                other => match apply_java_date_format(other, ms) {
+                    Some(s) => Value::String(s),
+                    None => Value::String(ms.to_string()),
+                },
+            }
+        }
+        "ip" => match v.as_str().and_then(|s| crate::fields::canonical_ip(s).ok()) {
+            Some(c) => Value::String(c),
+            None => v.clone(),
+        },
+        "date" => {
+            let ms = match integer_of(v) {
                 Some(n) => n,
                 None => return v.clone(),
             };
-            if ftype == "date_nanos" {
-                ms /= 1_000_000;
-            }
             match format {
-                "" | "strict_date_optional_time" | "date_optional_time" => {
+                "" | "strict_date_optional_time" | "date_optional_time"
+                | "strict_date_optional_time_nanos" | "date_optional_time_nanos" => {
                     Value::String(format_epoch_ms(ms))
                 }
                 "epoch_millis" => Value::String(ms.to_string()),
@@ -358,6 +395,21 @@ fn doc_values_output(
     spec: &FieldSpec,
     fallback_source: bool,
 ) -> Result<Option<Vec<Value>>, ApiError> {
+    let resolved = crate::eval::resolve_alias_field(idx, field);
+    let mut field = resolved.as_str();
+    let mut join_suffix: Option<String> = None;
+    if mapping_field_def(idx, field).is_none() {
+        if let Some((base, suffix)) = field.split_once('#') {
+            if mapping_field_def(idx, base)
+                .and_then(|d| d.get("type"))
+                .and_then(|t| t.as_str())
+                == Some("join")
+            {
+                join_suffix = Some(suffix.to_string());
+                field = base;
+            }
+        }
+    }
     let def = mapping_field_def(idx, field);
     let (ftype, has_dv) = match def {
         Some(d) => (
@@ -369,6 +421,30 @@ fn doc_values_output(
         ),
         None => (String::new(), true),
     };
+    let mut out_format = spec.format.clone();
+    if out_format.is_empty() {
+        if let Some(d) = def {
+            if matches!(ftype.as_str(), "date" | "date_nanos") {
+                if let Some(mf) = d.get("format").and_then(|v| v.as_str()) {
+                    if !mf.is_empty()
+                        && !mf.contains("||")
+                        && !matches!(
+                            mf,
+                            "strict_date_optional_time"
+                                | "date_optional_time"
+                                | "strict_date_optional_time_nanos"
+                                | "epoch_millis"
+                                | "epoch_second"
+                                | "date_time"
+                                | "basic_date_time"
+                        )
+                    {
+                        out_format = mf.to_string();
+                    }
+                }
+            }
+        }
+    }
     let vals: Option<Vec<Value>> = idx
         .doc_values
         .get(id)
@@ -392,7 +468,7 @@ fn doc_values_output(
                     return Ok(Some(
                         list.iter()
                             .map(|x| {
-                                format_geo(x, spec.format == "wkt", spec.format.is_empty())
+                                format_geo(x, out_format == "wkt", out_format.is_empty())
                             })
                             .collect(),
                     ));
@@ -402,7 +478,7 @@ fn doc_values_output(
                 }
                 return Ok(Some(
                     list.iter()
-                        .map(|x| format_doc_value(&ftype, x, &spec.format))
+                        .map(|x| format_doc_value(&ftype, x, &out_format))
                         .collect(),
                 ));
             }
@@ -413,10 +489,13 @@ fn doc_values_output(
         Some(v) if !v.is_empty() => Ok(Some(
             v.iter()
                 .map(|x| {
+                    if ftype == "join" {
+                        return join_output_value(x, join_suffix.as_deref());
+                    }
                     if ftype == "geo_point" {
-                        format_geo(x, spec.format == "wkt", fallback_source && spec.format.is_empty())
+                        format_geo(x, out_format == "wkt", fallback_source && out_format.is_empty())
                     } else {
-                        format_doc_value(&ftype, x, &spec.format)
+                        format_doc_value(&ftype, x, &out_format)
                     }
                 })
                 .collect(),
@@ -425,9 +504,54 @@ fn doc_values_output(
     }
 }
 
+fn join_output_value(v: &Value, suffix: Option<&str>) -> Value {
+    let (name, parent) = match v {
+        Value::String(s) => (s.clone(), String::new()),
+        Value::Object(m) => (
+            m.get("name")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            m.get("parent")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+        ),
+        _ => (String::new(), String::new()),
+    };
+    match suffix {
+        Some(s) if s == name => Value::String(parent),
+        Some(s) => {
+            let _ = s;
+            Value::String(parent)
+        }
+        None => Value::String(name),
+    }
+}
+
 // ------------------------------------------------------------------- sorting
 
 fn compare_sort_values(a: &Value, b: &Value) -> Ordering {
+    if let (Value::Number(na), Value::Number(nb)) = (a, b) {
+        if let (Some(x), Some(y)) = (na.as_u64(), nb.as_u64()) {
+            return x.cmp(&y);
+        }
+        if let (Some(x), Some(y)) = (na.as_i64(), nb.as_i64()) {
+            return x.cmp(&y);
+        }
+        if let (Some(x), Some(y)) = (na.as_u64(), nb.as_i64()) {
+            if y < 0 {
+                return Ordering::Greater;
+            }
+            return x.cmp(&(y as u64));
+        }
+        if let (Some(x), Some(y)) = (na.as_i64(), nb.as_u64()) {
+            if x < 0 {
+                return Ordering::Less;
+            }
+            return (x as u64).cmp(&y);
+        }
+    }
     if (a.is_string() && b.is_number()) || (a.is_number() && b.is_string()) {
         if let (Some(x), Some(y)) = (to_f64(a), to_f64(b)) {
             return x.partial_cmp(&y).unwrap_or(Ordering::Equal);
@@ -435,6 +559,9 @@ fn compare_sort_values(a: &Value, b: &Value) -> Ordering {
     }
     if let Some(as_) = a.as_str() {
         let bs = value_to_string(b).unwrap_or_default();
+        if let (Some(x), Some(y)) = (crate::eval::ip_to_16(as_), crate::eval::ip_to_16(&bs)) {
+            return x.cmp(&y);
+        }
         return as_.cmp(&bs);
     }
     if let (Some(af), Some(bf)) = (to_f64(a), to_f64(b)) {
@@ -668,8 +795,14 @@ fn parse_sort_specs(raw: Option<&Value>) -> Result<Vec<SortSpec>, ApiError> {
 }
 
 fn sort_mapping_def(idx: &Index, field: &str) -> Option<Map<String, Value>> {
+    let field = &crate::eval::resolve_alias_field(idx, field);
     if let Some(d) = mapping_field_def(idx, field) {
         return Some(d.clone());
+    }
+    if crate::fields::flat_object_root(idx, field).is_some() {
+        let mut d = Map::new();
+        d.insert("type".to_string(), json!("keyword"));
+        return Some(d);
     }
     let (parent, sub) = field.rsplit_once('.')?;
     let pd = mapping_field_def(idx, parent)?;
@@ -755,14 +888,37 @@ fn source_sort_list(idx: &Index, id: &str, field: &str) -> Vec<Value> {
 }
 
 fn convert_sort_scalar(sp: &SortSpec, ftype: &str, v: &Value) -> Value {
-    if matches!(sp.numeric_type.as_deref(), Some("date_nanos")) {
+    if matches!(sp.numeric_type.as_deref(), Some("date_nanos")) && ftype != "date_nanos" {
+        if let Some(ms) = integer_of(v) {
+            return json!(ms * 1_000_000);
+        }
         if let Some(ms) = crate::store::parse_date(v) {
             return json!((ms * 1_000_000.0) as i64);
         }
     }
-    if ftype == "date" || ftype == "date_nanos" {
+    if ftype == "date_nanos" || matches!(sp.numeric_type.as_deref(), Some("date_nanos")) {
+        if let Some(n) = integer_of(v) {
+            return json!(n);
+        }
+        if let Some(s) = v.as_str() {
+            if let Some(ns) = crate::fields::parse_date_nanos_any(&Map::new(), s) {
+                return json!(ns);
+            }
+        }
+        if let Some(ms) = crate::store::parse_date(v) {
+            return json!((ms * 1_000_000.0) as i64);
+        }
+    }
+    if ftype == "date" {
         if let Some(ms) = crate::store::parse_date(v) {
             return json!(ms as i64);
+        }
+    }
+    if ftype == "ip" {
+        if let Some(s) = v.as_str() {
+            if let Ok(c) = crate::fields::canonical_ip(s) {
+                return Value::String(c);
+            }
         }
     }
     if sp.numeric_type.as_deref() == Some("long") {
@@ -904,13 +1060,68 @@ fn geo_point(v: &Value) -> Option<(f64, f64)> {
             Some((lat, lon))
         }
         Value::String(s) => {
-            let mut it = s.split(',');
-            let lat = it.next()?.trim().parse::<f64>().ok()?;
-            let lon = it.next()?.trim().parse::<f64>().ok()?;
-            Some((lat, lon))
+            let t = s.trim();
+            if t.to_ascii_uppercase().starts_with("POINT") {
+                let inner = t
+                    .split_once('(')
+                    .and_then(|(_, r)| r.rsplit_once(')'))
+                    .map(|(l, _)| l)
+                    .unwrap_or(t);
+                let parts: Vec<&str> = inner.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    let lon: f64 = parts[0].parse().ok()?;
+                    let lat: f64 = parts[1].parse().ok()?;
+                    return Some((lat, lon));
+                }
+                return None;
+            }
+            let mut it = t.split(',');
+            let lat = it.next()?.trim().parse::<f64>().ok();
+            let lon = it.next().and_then(|v| v.trim().parse::<f64>().ok());
+            if let (Some(lat), Some(lon)) = (lat, lon) {
+                return Some((lat, lon));
+            }
+            decode_geohash_search(t)
         }
         _ => None,
     }
+}
+
+fn decode_geohash_search(s: &str) -> Option<(f64, f64)> {
+    const B32: &[u8] = b"0123456789bcdefghjkmnpqrstuvwxyz";
+    let mut even = true;
+    let mut lat_min = -90.0f64;
+    let mut lat_max = 90.0f64;
+    let mut lon_min = -180.0f64;
+    let mut lon_max = 180.0f64;
+    let mut seen = false;
+    for c in s.chars() {
+        let ci = B32.iter().position(|b| *b as char == c.to_ascii_lowercase())?;
+        seen = true;
+        for bit in (0..5).rev() {
+            let one = (ci >> bit) & 1 == 1;
+            if even {
+                let mid = (lon_min + lon_max) / 2.0;
+                if one {
+                    lon_min = mid;
+                } else {
+                    lon_max = mid;
+                }
+            } else {
+                let mid = (lat_min + lat_max) / 2.0;
+                if one {
+                    lat_min = mid;
+                } else {
+                    lat_max = mid;
+                }
+            }
+            even = !even;
+        }
+    }
+    if !seen {
+        return None;
+    }
+    Some(((lat_min + lat_max) / 2.0, (lon_min + lon_max) / 2.0))
 }
 
 fn haversine_km(a: (f64, f64), b: (f64, f64)) -> f64 {
@@ -953,12 +1164,13 @@ fn compute_sort_cell(store: &Store, h: &MultiHit, sp: &SortSpec) -> Result<(bool
         if origins.is_empty() {
             return Ok((false, json!("Infinity")));
         }
-        let pts: Vec<(f64, f64)> = field_value(&h.doc, &sp.field)
-            .map(flatten_any)
-            .unwrap_or_default()
-            .iter()
-            .filter_map(geo_point)
-            .collect();
+        let pts: Vec<(f64, f64)> = match field_value(&h.doc, &sp.field) {
+            Some(v @ Value::Array(a)) if a.len() == 2 && a.iter().all(|x| x.is_number()) => {
+                geo_point(v).into_iter().collect()
+            }
+            Some(v) => flatten_any(v).iter().filter_map(geo_point).collect(),
+            None => Vec::new(),
+        };
         if pts.is_empty() {
             return Ok((false, json!("Infinity")));
         }
@@ -1004,7 +1216,20 @@ fn compute_sort_cell(store: &Store, h: &MultiHit, sp: &SortSpec) -> Result<(bool
         }
         return Ok((true, Value::Null));
     }
-    if ftype == "text" {
+    let text_fielddata = ftype == "text"
+        && def
+            .as_ref()
+            .and_then(|d| d.get("fielddata"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+    if ftype == "binary" {
+        let reason = format!(
+            "Can't load fielddata on [{}] because fielddata is unsupported on fields of type [binary]. Use doc values instead.",
+            sp.field
+        );
+        return Err(sort_shard_error("illegal_argument_exception", &reason));
+    }
+    if ftype == "text" && !text_fielddata {
         let reason = format!(
             "Text fields are not optimised for operations that require per-document field data like aggregations and sorting, so these operations are disabled by default. Please use a keyword field instead. Alternatively, set fielddata=true on [{}] in order to load field data by uninverting the inverted index. Note that this can use significant memory.",
             sp.field
@@ -1023,11 +1248,23 @@ fn compute_sort_cell(store: &Store, h: &MultiHit, sp: &SortSpec) -> Result<(bool
         vals = nested_sort_values(idx, &h.id, sp, path);
     } else if nested_missing {
         vals = vec![];
-    } else if let Some(dv) = idx.doc_values.get(&h.id).and_then(|m| m.get(&sp.field)) {
-        vals = crate::eval::array_values(dv);
+    } else {
+        let sf = crate::eval::resolve_alias_field(idx, &sp.field);
+        if let Some(dv) = idx.doc_values.get(&h.id).and_then(|m| m.get(&sf)) {
+            vals = crate::eval::array_values(dv);
+        }
     }
     if vals.is_empty() && sp.nested.is_none() && !nested_missing {
-        vals = source_sort_list(idx, &h.id, &sp.field);
+        let sf = crate::eval::resolve_alias_field(idx, &sp.field);
+        vals = source_sort_list(idx, &h.id, &sf);
+    }
+    if text_fielddata {
+        vals = vals
+            .iter()
+            .filter_map(|v| v.as_str())
+            .flat_map(crate::store::analyze)
+            .map(Value::String)
+            .collect();
     }
     vals = vals
         .iter()
@@ -1324,6 +1561,86 @@ fn remove_path(out: &mut Map<String, Value>, segs: &[String]) {
         }
         _ => {}
     }
+}
+
+pub(crate) fn mapping_source_spec(idx: &Index) -> Option<Value> {
+    let src = idx.mappings.get("_source")?.as_object()?;
+    let inc = src
+        .get("includes")
+        .or_else(|| src.get("include"))
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let exc = src
+        .get("excludes")
+        .or_else(|| src.get("exclude"))
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    Some(json!({"includes": inc, "excludes": exc}))
+}
+
+fn source_enabled_search(idx: &Index) -> bool {
+    idx.mappings
+        .get("_source")
+        .and_then(|s| s.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+}
+
+fn stored_paths(idx: &Index, patterns: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    fn walk(
+        props: &Map<String, Value>,
+        prefix: &str,
+        patterns: &[String],
+        out: &mut Vec<String>,
+    ) {
+        for (name, raw) in props {
+            let Some(def) = raw.as_object() else { continue };
+            let path = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{}.{}", prefix, name)
+            };
+            let matched = patterns.iter().any(|p| {
+                p == "*"
+                    || crate::shared::wildcard_match(p, &path)
+                    || (p == &path)
+            });
+            if def.get("store").and_then(|v| v.as_bool()) == Some(true) && matched {
+                out.push(path.clone());
+            }
+            if let Some(sub) = def.get("properties").and_then(|p| p.as_object()) {
+                walk(sub, &path, patterns, out);
+            }
+        }
+    }
+    if let Some(props) = idx.mappings.get("properties").and_then(|p| p.as_object()) {
+        walk(props, "", patterns, &mut out);
+    }
+    out
+}
+
+pub(crate) fn format_stored_value(ftype: &str, v: &Value) -> Value {
+    format_doc_value(ftype, v, "")
+}
+
+fn format_stored(idx: &Index, field: &str, v: &Value) -> Value {
+    let def = mapping_field_def(idx, field);
+    let ftype = def
+        .as_ref()
+        .and_then(|d| d.get("type"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("");
+    if matches!(ftype, "date" | "date_nanos") {
+        if let Some(s) = v.as_str() {
+            if let Some(d) = def.as_ref() {
+                if let Some(ms) = crate::fields::parse_date_any(d, s) {
+                    return format_doc_value("date", &json!(ms), "");
+                }
+            }
+        }
+    }
+    v.clone()
 }
 
 pub(crate) fn filter_source(doc: &Value, spec: &Value) -> Value {
@@ -1640,7 +1957,28 @@ fn walk_named_queries(
     q: &Value,
 ) -> Result<(), ApiError> {
     let Some(m) = q.as_object() else { return Ok(()) };
+    let compound = m.contains_key("bool")
+        || m.contains_key("constant_score")
+        || m.contains_key("function_score");
+    if !compound {
+        if let Some(name) = find_query_name(q) {
+            let clean = strip_query_names(q);
+            let cm = clean.as_object().cloned().unwrap_or_default();
+            let (ok, score) = eval_doc(idx, id, doc, extra, &cm)?;
+            if ok {
+                out.push((name, score));
+            }
+        }
+    }
     if let Some(b) = m.get("bool").and_then(|v| v.as_object()) {
+        if let Some(name) = b.get("_name").and_then(|v| v.as_str()) {
+            let clean = strip_query_names(q);
+            let cm = clean.as_object().cloned().unwrap_or_default();
+            let (ok, score) = eval_doc(idx, id, doc, extra, &cm)?;
+            if ok {
+                out.push((name.to_string(), score));
+            }
+        }
         for key in ["must", "should", "filter"] {
             if let Some(clauses) = b.get(key) {
                 match clauses {
@@ -1656,24 +1994,32 @@ fn walk_named_queries(
         return Ok(());
     }
     if let Some(cs) = m.get("constant_score").and_then(|v| v.as_object()) {
+        if let Some(name) = cs.get("_name").and_then(|v| v.as_str()) {
+            let clean = strip_query_names(q);
+            let cm = clean.as_object().cloned().unwrap_or_default();
+            let (ok, score) = eval_doc(idx, id, doc, extra, &cm)?;
+            if ok {
+                out.push((name.to_string(), score));
+            }
+        }
         if let Some(f) = cs.get("filter") {
             walk_named_queries(out, idx, id, doc, extra, f)?;
         }
         return Ok(());
     }
     if let Some(fs) = m.get("function_score").and_then(|v| v.as_object()) {
+        if let Some(name) = fs.get("_name").and_then(|v| v.as_str()) {
+            let clean = strip_query_names(q);
+            let cm = clean.as_object().cloned().unwrap_or_default();
+            let (ok, score) = eval_doc(idx, id, doc, extra, &cm)?;
+            if ok {
+                out.push((name.to_string(), score));
+            }
+        }
         if let Some(f) = fs.get("query") {
             walk_named_queries(out, idx, id, doc, extra, f)?;
         }
         return Ok(());
-    }
-    if let Some(name) = find_query_name(q) {
-        let clean = strip_query_names(q);
-        let cm = clean.as_object().cloned().unwrap_or_default();
-        let (ok, score) = eval_doc(idx, id, doc, extra, &cm)?;
-        if ok {
-            out.push((name, score));
-        }
     }
     Ok(())
 }
@@ -1731,6 +2077,435 @@ fn collapse_value(doc: &Value, field: &str) -> Option<Value> {
         Value::Null => None,
         other => Some(other.clone()),
     }
+}
+
+fn ih_collect_offsets(v: &Value, path: &str) -> Vec<(usize, Value)> {
+    if path.is_empty() {
+        return match v {
+            Value::Array(a) => a.iter().cloned().enumerate().collect(),
+            other => vec![(0, other.clone())],
+        };
+    }
+    if let Some(arr) = v.as_array() {
+        let mut out = Vec::new();
+        for e in arr {
+            out.extend(ih_collect_offsets(e, path));
+        }
+        return out;
+    }
+    let (head, rest) = match path.split_once('.') {
+        Some((h, r)) => (h, r),
+        None => (path, ""),
+    };
+    match v.get(head) {
+        Some(next) => ih_collect_offsets(next, rest),
+        None => Vec::new(),
+    }
+}
+
+fn ih_scoped_ctx<'a>(
+    idx: &'a Index,
+    id: &str,
+    doc: &'a Value,
+    path: &str,
+    child: &Value,
+) -> QueryCtx<'a> {
+    let mut vals = Map::new();
+    crate::eval_extra::flatten_scope(path, child, &mut vals);
+    let mut cc = QueryCtx::with_values(idx, id, doc, vals);
+    cc.scope_path = Some(path.to_string());
+    cc.scope_obj = Some(child.clone());
+    cc
+}
+
+fn ih_source(child: &Value, path: &str, spec: Option<&Value>) -> Value {
+    let includes = match spec {
+        Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>(),
+        Some(Value::String(s)) => vec![s.as_str()],
+        _ => return child.clone(),
+    };
+    if includes.is_empty() {
+        return child.clone();
+    }
+    let mut out = Map::new();
+    for inc in includes {
+        if inc == path {
+            return child.clone();
+        }
+        if let Some(rel) = inc.strip_prefix(&format!("{}.", path)) {
+            if let Some(v) = child.get(rel) {
+                out.insert(rel.to_string(), v.clone());
+            }
+        }
+    }
+    Value::Object(out)
+}
+
+fn ih_sort_fields(spec: Option<&Value>) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    let arr = match spec {
+        Some(Value::Array(a)) => a.clone(),
+        Some(other) => vec![other.clone()],
+        None => return out,
+    };
+    for item in arr {
+        match &item {
+            Value::String(f) => out.push((f.clone(), false)),
+            Value::Object(m) => {
+                for (f, cfg) in m {
+                    let desc = match cfg {
+                        Value::String(s) => s == "desc",
+                        Value::Object(o) => {
+                            o.get("order").and_then(|v| v.as_str()) == Some("desc")
+                        }
+                        _ => false,
+                    };
+                    out.push((f.clone(), desc));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn ih_sort_value(ctx: &QueryCtx, field: &str) -> Value {
+    let (vals, _) = ctx.values(field);
+    vals.into_iter().next().unwrap_or(Value::Null)
+}
+
+fn ih_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
+    let an = a.as_f64();
+    let bn = b.as_f64();
+    match (an, bn) {
+        (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+        _ => a
+            .as_str()
+            .unwrap_or("")
+            .cmp(b.as_str().unwrap_or("")),
+    }
+}
+
+fn ih_build_group(
+    mut hits: Vec<(usize, Value, Vec<Value>, Map<String, Value>)>,
+    path: &str,
+    spec: &Map<String, Value>,
+    outer: Option<(&str, usize)>,
+    source_spec: Option<&Value>,
+    id: &str,
+) -> Value {
+    let sorts = ih_sort_fields(spec.get("sort"));
+    if !sorts.is_empty() {
+        hits.sort_by(|a, b| {
+            for i in 0..sorts.len() {
+                let mut c = ih_cmp(&a.2[i], &b.2[i]);
+                if sorts[i].1 {
+                    c = c.reverse();
+                }
+                if c != std::cmp::Ordering::Equal {
+                    return c;
+                }
+            }
+            a.0.cmp(&b.0)
+        });
+    }
+    let from = spec.get("from").and_then(to_f64).map(|n| n as usize).unwrap_or(0);
+    let size = spec.get("size").and_then(to_f64).map(|n| n as usize).unwrap_or(3);
+    let total = hits.len();
+    let mut inner = Vec::new();
+    for (offset, child, svals, mut extra) in hits.into_iter().skip(from).take(size) {
+        let mut e = Map::new();
+        if let Some(v) = extra.remove("_id") {
+            e.insert("_id".to_string(), v);
+        } else {
+            e.insert("_id".to_string(), json!(id));
+        }
+        if !path.is_empty() {
+            let meta = match outer {
+                Some((opath, ooff)) => {
+                    let mut m = Map::new();
+                    m.insert("field".to_string(), json!(opath));
+                    m.insert("offset".to_string(), json!(ooff));
+                    let mut sub = Map::new();
+                    sub.insert(
+                        "field".to_string(),
+                        json!(path.rsplit('.').next().unwrap_or(path)),
+                    );
+                    sub.insert("offset".to_string(), json!(offset));
+                    m.insert("_nested".to_string(), Value::Object(sub));
+                    Value::Object(m)
+                }
+                None => json!({"field": path, "offset": offset}),
+            };
+            e.insert("_nested".to_string(), meta);
+        }
+        e.insert(
+            "_source".to_string(),
+            ih_source(&child, path, source_spec),
+        );
+        if !svals.is_empty() {
+            e.insert("sort".to_string(), Value::Array(svals));
+        }
+        if let Some(r) = extra.remove("_routing") {
+            e.insert("_routing".to_string(), r);
+        }
+        if let Some(ih) = extra.remove("inner_hits") {
+            e.insert("inner_hits".to_string(), ih);
+        }
+        inner.push(Value::Object(e));
+    }
+    let mut hits_obj = Map::new();
+    hits_obj.insert("total".to_string(), json!({"value": total, "relation": "eq"}));
+    hits_obj.insert("hits".to_string(), Value::Array(inner));
+    let mut group = Map::new();
+    group.insert("hits".to_string(), Value::Object(hits_obj));
+    Value::Object(group)
+}
+
+fn find_percolate_map<'a>(q: &'a Map<String, Value>) -> Option<&'a Map<String, Value>> {
+    if let Some(p) = q.get("percolate").and_then(|v| v.as_object()) {
+        return Some(p);
+    }
+    for key in ["bool", "constant_score", "function_score"] {
+        if let Some(bm) = q.get(key).and_then(|v| v.as_object()) {
+            for (k, v) in bm {
+                if k == "query" {
+                    if let Some(sub) = v.as_object() {
+                        if let Some(p) = find_percolate_map(sub) {
+                            return Some(p);
+                        }
+                    }
+                } else if matches!(k.as_str(), "must" | "should" | "filter") {
+                    let items: Vec<&Value> = match v {
+                        Value::Array(a) => a.iter().collect(),
+                        other => vec![other],
+                    };
+                    for item in items {
+                        if let Some(sub) = item.as_object() {
+                            if let Some(p) = find_percolate_map(sub) {
+                                return Some(p);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn build_query_inner_hits(
+    idx: &Index,
+    id: &str,
+    doc: &Value,
+    q: &Map<String, Value>,
+    scope_path: Option<&str>,
+    scope_obj: Option<&Value>,
+    outer: Option<(&str, usize)>,
+) -> Result<Map<String, Value>, ApiError> {
+    let mut out = Map::new();
+    for (key, val) in q {
+        if key == "nested" {
+            let Some(bm) = val.as_object() else { continue };
+            let path = bm.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            if path.is_empty() {
+                continue;
+            }
+            let inner = bm.get("query").and_then(|v| v.as_object());
+            let children = if let Some(sp) = scope_path {
+                if path.starts_with(&format!("{}.", sp)) {
+                    match scope_obj {
+                        Some(o) => ih_collect_offsets(o, &path[sp.len() + 1..]),
+                        None => Vec::new(),
+                    }
+                } else {
+                    ih_collect_offsets(doc, path)
+                }
+            } else {
+                ih_collect_offsets(doc, path)
+            };
+            let spec = bm.get("inner_hits").and_then(|v| v.as_object());
+            let sorts = spec
+                .map(|s| ih_sort_fields(s.get("sort")))
+                .unwrap_or_default();
+            let mut matched = Vec::new();
+            for (offset, child) in children {
+                if !child.is_object() {
+                    continue;
+                }
+                let cc = ih_scoped_ctx(idx, id, doc, path, &child);
+                let mut extra = Map::new();
+                if let Some(inner) = inner {
+                    let (ok, _) = cc.eval(inner)?;
+                    if !ok {
+                        continue;
+                    }
+                    let sub = build_query_inner_hits(
+                        idx,
+                        id,
+                        doc,
+                        inner,
+                        Some(path),
+                        Some(&child),
+                        Some((path, offset)),
+                    )?;
+                    if !sub.is_empty() {
+                        extra.insert("inner_hits".to_string(), Value::Object(sub));
+                    }
+                }
+                let mut svals = Vec::new();
+                for (f, _) in &sorts {
+                    svals.push(ih_sort_value(&cc, f));
+                }
+                matched.push((offset, child, svals, extra));
+            }
+            if let Some(spec) = spec {
+                let name = spec
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(path)
+                    .to_string();
+                let group = ih_build_group(
+                    matched,
+                    path,
+                    spec,
+                    outer,
+                    spec.get("_source"),
+                    id,
+                );
+                out.insert(name, group);
+            }
+            continue;
+        }
+        if key == "has_child" {
+            let Some(bm) = val.as_object() else { continue };
+            let Some(spec) = bm.get("inner_hits").and_then(|v| v.as_object()) else {
+                continue;
+            };
+            let child_type = bm.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let inner = bm.get("query").and_then(|v| v.as_object());
+            let field = match crate::eval_extra::find_join_field(idx) {
+                Some(f) => f,
+                None => continue,
+            };
+            let sorts = ih_sort_fields(spec.get("sort"));
+            let mut matched = Vec::new();
+            for cid in &idx.order {
+                let Some(cdoc) = idx.docs.get(cid) else { continue };
+                let (name, parent) = crate::eval_extra::join_parts(cdoc.get(&field));
+                if parent != id || (!child_type.is_empty() && name != child_type) {
+                    continue;
+                }
+                let cc = QueryCtx::new(idx, cid, cdoc);
+                if let Some(inner) = inner {
+                    let (ok, _) = cc.eval(inner)?;
+                    if !ok {
+                        continue;
+                    }
+                }
+                let mut svals = Vec::new();
+                for (f, _) in &sorts {
+                    svals.push(ih_sort_value(&cc, f));
+                }
+                let mut extra = Map::new();
+                extra.insert("_id".to_string(), json!(cid));
+                if let Some(r) = idx.routing.get(cid) {
+                    extra.insert("_routing".to_string(), json!(r));
+                }
+                matched.push((0usize, cdoc.clone(), svals, extra));
+            }
+            let name = spec
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(child_type)
+                .to_string();
+            let group = ih_build_group(
+                matched,
+                "",
+                spec,
+                None,
+                spec.get("_source"),
+                id,
+            );
+            out.insert(name, group);
+            continue;
+        }
+        if key == "has_parent" {
+            let Some(bm) = val.as_object() else { continue };
+            let Some(spec) = bm.get("inner_hits").and_then(|v| v.as_object()) else {
+                continue;
+            };
+            let ptype = bm
+                .get("parent_type")
+                .and_then(|v| v.as_str())
+                .or_else(|| bm.get("type").and_then(|v| v.as_str()))
+                .unwrap_or("");
+            let pid = idx.routing.get(id).cloned().unwrap_or_default();
+            let Some(pdoc) = idx.docs.get(&pid) else { continue };
+            let field = match crate::eval_extra::find_join_field(idx) {
+                Some(f) => f,
+                None => continue,
+            };
+            let (name, _) = crate::eval_extra::join_parts(pdoc.get(&field));
+            if !ptype.is_empty() && name != ptype {
+                continue;
+            }
+            if let Some(inner) = bm.get("query").and_then(|v| v.as_object()) {
+                let cc = QueryCtx::new(idx, &pid, pdoc);
+                let (ok, _) = cc.eval(inner)?;
+                if !ok {
+                    continue;
+                }
+            }
+            let mut hit = Map::new();
+            hit.insert("_id".to_string(), json!(pid));
+            hit.insert("_source".to_string(), pdoc.clone());
+            let mut hits_obj = Map::new();
+            hits_obj.insert("total".to_string(), json!({"value": 1, "relation": "eq"}));
+            hits_obj.insert("hits".to_string(), Value::Array(vec![Value::Object(hit)]));
+            let mut group = Map::new();
+            group.insert("hits".to_string(), Value::Object(hits_obj));
+            let gname = spec
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(ptype)
+                .to_string();
+            out.insert(gname, Value::Object(group));
+            continue;
+        }
+        if matches!(key.as_str(), "bool" | "constant_score" | "function_score") {
+            if let Some(bm) = val.as_object() {
+                for (k2, v2) in bm {
+                    if k2 == "query" {
+                        if let Some(sub) = v2.as_object() {
+                            let got = build_query_inner_hits(
+                                idx, id, doc, sub, scope_path, scope_obj, outer,
+                            )?;
+                            for (k, v) in got {
+                                out.insert(k, v);
+                            }
+                        }
+                    } else if matches!(k2.as_str(), "must" | "should" | "filter") {
+                        let arr = match v2 {
+                            Value::Array(a) => a.clone(),
+                            other => vec![other.clone()],
+                        };
+                        for item in arr {
+                            if let Some(sub) = item.as_object() {
+                                let got = build_query_inner_hits(
+                                    idx, id, doc, sub, scope_path, scope_obj, outer,
+                                )?;
+                                for (k, v) in got {
+                                    out.insert(k, v);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn build_collapse_inner_hits(
@@ -1817,6 +2592,91 @@ fn build_collapse_inner_hits(
 }
 
 // ------------------------------------------------------------------ run search
+
+fn resolve_terms_lookups(store: &Store, v: &mut Value) -> Result<(), ApiError> {
+    match v {
+        Value::Object(m) => {
+            if let Some(terms) = m.get_mut("terms").and_then(|t| t.as_object_mut()) {
+                let keys: Vec<String> = terms.keys().cloned().collect();
+                for field in keys {
+                    let lookup = match terms.get(&field).and_then(|x| x.as_object()) {
+                        Some(o) if o.contains_key("index") && o.contains_key("id") => o.clone(),
+                        _ => continue,
+                    };
+                    let index = lookup
+                        .get("index")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let id = lookup
+                        .get("id")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let path = lookup
+                        .get("path")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let idx = match store.indices.get(&index) {
+                        Some(i) => i,
+                        None => {
+                            return Err(ApiError::new(
+                                "index_not_found_exception",
+                                &format!("no such index [{}]", index),
+                                404,
+                            ))
+                        }
+                    };
+                    let mut vals = Vec::new();
+                    if let Some(doc) = idx.docs.get(&id) {
+                        let parts: Vec<&str> = path.split('.').filter(|p| !p.is_empty()).collect();
+                        lookup_path_values(doc, &parts, &mut vals);
+                    }
+                    terms.insert(field, Value::Array(vals));
+                }
+            }
+            for (_, child) in m.iter_mut() {
+                resolve_terms_lookups(store, child)?;
+            }
+        }
+        Value::Array(a) => {
+            for child in a.iter_mut() {
+                resolve_terms_lookups(store, child)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn lookup_path_values(v: &Value, parts: &[&str], out: &mut Vec<Value>) {
+    if parts.is_empty() {
+        match v {
+            Value::Array(a) => {
+                for e in a {
+                    lookup_path_values(e, parts, out);
+                }
+            }
+            Value::Null => {}
+            other => out.push(other.clone()),
+        }
+        return;
+    }
+    match v {
+        Value::Object(m) => {
+            if let Some(next) = m.get(parts[0]) {
+                lookup_path_values(next, &parts[1..], out);
+            }
+        }
+        Value::Array(a) => {
+            for e in a {
+                lookup_path_values(e, parts, out);
+            }
+        }
+        _ => {}
+    }
+}
 
 pub fn run_search(
     store: &Store,
@@ -1923,9 +2783,18 @@ pub fn run_search(
         }
     }
     let query: Map<String, Value> = match query {
-        Some(m) => m,
+        Some(m) => {
+            let mut qv = Value::Object(m);
+            resolve_terms_lookups(store, &mut qv)?;
+            qv.as_object().cloned().unwrap_or_default()
+        }
         None => Map::new(),
     };
+    for n in names {
+        if let Some(idx) = store.indices.get(n) {
+            crate::eval::validate_query(idx, &query)?;
+        }
+    }
 
     let mut from = bodym
         .get("from")
@@ -2137,17 +3006,7 @@ pub fn run_search(
         }
     }
     if let Some(ms) = bodym.get("min_score").and_then(to_f64) {
-        let divisor = if let Some(mq) = query.get("match").and_then(|m| m.as_object()) {
-            let text = mq
-                .get("query")
-                .and_then(|q| q.as_str())
-                .or_else(|| mq.values().find_map(|v| v.as_str()))
-                .unwrap_or("");
-            (text.split_whitespace().count() + 1) as f64
-        } else {
-            1.0
-        };
-        matched.retain(|h| h.score / divisor >= ms);
+        matched.retain(|h| h.score >= ms);
     }
     if let Some(rc) = bodym.get("rescore") {
         apply_rescore(store, &mut matched, rc)?;
@@ -2252,6 +3111,22 @@ pub fn run_search(
         ));
     }
     for sp in &specs {
+        if sp.kind == 0 && !sp.field.is_empty() {
+            for n in names {
+                if let Some(idx) = store.indices.get(n) {
+                    if let Some(def) = mapping_field_def(idx, &sp.field) {
+                        if def.get("doc_values").and_then(|v| v.as_bool()) == Some(false) {
+                            let ftype = def.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                            let reason = format!(
+                                "Can't load fielddata on [{}] because fielddata is unsupported on fields of type [{}]. Use doc values instead.",
+                                sp.field, ftype
+                            );
+                            return Err(search_phase_error(&reason));
+                        }
+                    }
+                }
+            }
+        }
         if sp.kind == 6 && sp.geo_ignore {
             continue;
         }
@@ -2280,8 +3155,24 @@ pub fn run_search(
                 let idx = &store.indices[n];
                 match sort_mapping_def(idx, &sp.field) {
                     Some(d) => {
+                        if matches!(
+                            d.get("type").and_then(|t| t.as_str()),
+                            Some("rank_feature") | Some("rank_features")
+                        ) {
+                            return Err(sort_shard_error(
+                                "illegal_argument_exception",
+                                "[rank_feature] fields do not support sorting, scripting or aggregating",
+                            ));
+                        }
+                        if d.get("type").and_then(|t| t.as_str()) == Some("geo_shape") {
+                            return Err(sort_shard_error(
+                                "illegal_argument_exception",
+                                "can't sort on geo_shape field without using specific sorting feature, like geo_distance",
+                            ));
+                        }
                         if sp.nested.is_none()
                             && d.get("type").and_then(|t| t.as_str()) == Some("text")
+                            && d.get("fielddata").and_then(|v| v.as_bool()) != Some(true)
                             && nested_parent_of(idx, &sp.field).is_none()
                         {
                             let reason = format!(
@@ -2489,11 +3380,17 @@ pub fn run_search(
             }
         }
     }
-    let source_filter = if src_inc.is_empty() && src_exc.is_empty() {
+    let mut source_filter = if src_inc.is_empty() && src_exc.is_empty() {
         None
     } else {
         Some(json!({"includes": src_inc, "excludes": src_exc}))
     };
+    if source_filter.is_none() {
+        source_filter = names
+            .iter()
+            .filter_map(|n| mapping_source_spec(&store.indices[n]))
+            .next();
+    }
     let source_explicit = source_raw.is_some() || req.param("_source").is_some();
     let source_false = matches!(source_raw, Some(Value::Bool(false)))
         || req.param("_source") == Some("false");
@@ -2520,7 +3417,12 @@ pub fn run_search(
                 .filter(|s| s != "_none_")
                 .collect(),
         ),
-        Some(Value::String(s)) if s != "_none_" => Some(vec![s.clone()]),
+        Some(Value::String(s)) if s != "_none_" => Some(
+            s.split(',')
+                .filter(|x| !x.is_empty())
+                .map(|x| x.to_string())
+                .collect(),
+        ),
         _ => None,
     };
     if stored_none && source_true {
@@ -2529,8 +3431,8 @@ pub fn run_search(
         e.root_cause = Some(Box::new(ApiError::new("search_exception", reason, 500)));
         return Err(e);
     }
-    let omit_source =
-        source_false || stored_raw.is_some() || (has_script_fields && !source_explicit);
+    let omit_source = source_false
+        || ((stored_raw.is_some() || has_script_fields) && !source_explicit);
     let omit_id = stored_none;
     let mut tokens = HashSet::new();
     collect_tokens(&query, &mut tokens);
@@ -2565,6 +3467,13 @@ pub fn run_search(
         for n in names {
             if let Some(d) = mapping_field_def(&store.indices[n], &spec.name) {
                 let t = d.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if t == "binary" {
+                    let reason = format!(
+                        "Can't load fielddata on [{}] because fielddata is unsupported on fields of type [binary]. Use doc values instead.",
+                        spec.name
+                    );
+                    return Err(search_phase_error(&reason));
+                }
                 if text_like_type(t) {
                     let reason = format!(
                         "Text fields are not optimised for operations that require per-document field data like aggregations and sorting, so these operations are disabled by default. Please use a keyword field instead. Alternatively, set fielddata=true on [{}] in order to load field data by uninverting the inverted index. Note that this can use significant memory.",
@@ -2672,8 +3581,14 @@ pub fn run_search(
             }
             entry.insert("sort".to_string(), Value::Array(svals));
         }
-        if !omit_source {
+        if !omit_source && source_enabled_search(idx) {
             entry.insert("_source".to_string(), src);
+        }
+        if let Some(ign) = idx.doc_ignored.get(&h.id) {
+            entry.insert(
+                "_ignored".to_string(),
+                json!(ign.iter().map(|f| json!(f)).collect::<Vec<_>>()),
+            );
         }
         let want_version = match req.param("version") {
             Some(v) => v == "true",
@@ -2701,22 +3616,16 @@ pub fn run_search(
         }
         if let Some(fields) = &stored_list {
             let mut out = Map::new();
-            for f in fields {
-                let stored = idx
-                    .mappings
-                    .get("properties")
-                    .and_then(|p| p.get(f))
-                    .and_then(|d| d.get("store"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                if stored {
-                    if let Some(v) = h.doc.get(f) {
-                        let vals = match v {
-                            Value::Array(a) => a.clone(),
-                            other => vec![other.clone()],
-                        };
-                        out.insert(f.clone(), Value::Array(vals));
-                    }
+            for f in stored_paths(idx, fields) {
+                if let Some(v) = crate::store::field_value(&h.doc, &f) {
+                    let vals = match v {
+                        Value::Array(a) => a
+                            .iter()
+                            .map(|x| format_stored(idx, &f, x))
+                            .collect(),
+                        other => vec![format_stored(idx, &f, other)],
+                    };
+                    out.insert(f, Value::Array(vals));
                 }
             }
             if !out.is_empty() {
@@ -2724,12 +3633,80 @@ pub fn run_search(
             }
         }
         if let Some(hl) = bodym.get("highlight") {
-            if let Some(rendered) = crate::highlight::render(hl, &query, &h.doc, idx)? {
-                entry.insert("highlight".to_string(), rendered);
+            if source_enabled_search(idx) {
+                if let Some(rendered) = crate::highlight::render(hl, &query, &h.doc, idx)? {
+                    entry.insert("highlight".to_string(), rendered);
+                }
+            }
+        }
+        if let Some(pq) = find_percolate_map(&query) {
+            let inputs = crate::eval_extra::percolate_inputs(idx, pq)?;
+            if let Some(inputs) = inputs {
+                let field = pq
+                    .get("field")
+                    .and_then(|f| f.as_str())
+                    .unwrap_or("query");
+                if let Some(stored) = h.doc.get(field).and_then(|v| v.as_object()) {
+                    let multiple = pq.contains_key("documents");
+                    let mut slots: Vec<Value> = Vec::new();
+                    let mut hl_out = Map::new();
+                    for (slot, input) in inputs {
+                        let input_obj = Value::Object(input.clone());
+                        let vals = crate::fields::doc_values_for(idx, "_percolate", &input)
+                            .map(|v| v.0)
+                            .unwrap_or_default();
+                        let vals_map: Map<String, Value> = vals
+                            .into_iter()
+                            .map(|(k, v)| (k, Value::Array(v)))
+                            .collect();
+                        let qc = QueryCtx::with_values(
+                            idx,
+                            "_percolate",
+                            &input_obj,
+                            vals_map,
+                        );
+                        let ok = matches!(qc.eval(stored), Ok((true, _)));
+                        if !ok {
+                            continue;
+                        }
+                        slots.push(json!(slot));
+                        if let Some(hl) = bodym.get("highlight") {
+                            if let Some(Value::Object(rendered)) =
+                                crate::highlight::render(hl, stored, &input_obj, idx)?
+                            {
+                                for (f, v) in rendered {
+                                    let key = if multiple {
+                                        format!("{}_{}", slot, f)
+                                    } else {
+                                        f
+                                    };
+                                    hl_out.insert(key, v);
+                                }
+                            }
+                        }
+                    }
+                    if !slots.is_empty() {
+                        let mut fields = match entry.remove("fields") {
+                            Some(Value::Object(m)) => m,
+                            _ => Map::new(),
+                        };
+                        fields.insert(
+                            "_percolator_document_slot".to_string(),
+                            Value::Array(slots),
+                        );
+                        entry.insert("fields".to_string(), Value::Object(fields));
+                    }
+                    if !hl_out.is_empty() {
+                        entry.insert("highlight".to_string(), Value::Object(hl_out));
+                    }
+                }
             }
         }
         if !dv_fields.is_empty() || !param_fields.is_empty() {
-            let mut out: Map<String, Value> = Map::new();
+            let mut out: Map<String, Value> = match entry.remove("fields") {
+                Some(Value::Object(m)) => m,
+                _ => Map::new(),
+            };
             for (specs, fallback) in [(&dv_fields, false), (&param_fields, true)] {
                 for spec in specs {
                     let mut fnames = vec![spec.name.clone()];
@@ -2746,16 +3723,19 @@ pub fn run_search(
                         fnames.sort();
                     }
                     for fname in fnames {
-                        if out.contains_key(&fname) {
-                            continue;
-                        }
                         if fallback && mapping_field_def(idx, &fname).is_none() {
                             continue;
                         }
                         if let Some(vals) =
                             doc_values_output(idx, &h.id, &fname, spec, fallback)?
                         {
-                            out.insert(fname, Value::Array(vals));
+                            if let Some(existing) =
+                                out.get_mut(&fname).and_then(|v| v.as_array_mut())
+                            {
+                                existing.extend(vals);
+                            } else {
+                                out.insert(fname, Value::Array(vals));
+                            }
                         }
                     }
                 }
@@ -2793,13 +3773,33 @@ pub fn run_search(
                 entry.insert("fields".to_string(), Value::Object(out));
             }
         }
+        {
+            let groups = build_query_inner_hits(idx, &h.id, &h.doc, &query, None, None, None)?;
+            if !groups.is_empty() {
+                let mut out = match entry.remove("inner_hits") {
+                    Some(Value::Object(m)) => m,
+                    _ => Map::new(),
+                };
+                for (k, v) in groups {
+                    out.insert(k, v);
+                }
+                entry.insert("inner_hits".to_string(), Value::Object(out));
+            }
+        }
         if let Some(c) = &collapse_cfg {
             if let Some(ih) = c.get("inner_hits") {
                 let field = c.get("field").and_then(|v| v.as_str()).unwrap_or("");
                 let val = collapse_value(&h.doc, field);
                 let built =
                     build_collapse_inner_hits(store, &collapse_pool, field, &val, ih)?;
-                entry.insert("inner_hits".to_string(), Value::Object(built));
+                let mut out = match entry.remove("inner_hits") {
+                    Some(Value::Object(m)) => m,
+                    _ => Map::new(),
+                };
+                for (k, v) in built {
+                    out.insert(k, v);
+                }
+                entry.insert("inner_hits".to_string(), Value::Object(out));
             }
         }
         hits.push(Value::Object(entry));
@@ -3224,15 +4224,17 @@ fn apply_search_extras(
         {
             for hit in hits.iter_mut() {
                 if let Some(o) = hit.as_object_mut() {
-                    let score = o.get("_score").cloned().unwrap_or(json!(1.0));
-                    o.insert(
-                        "_explanation".to_string(),
-                        json!({
-                            "value": score,
-                            "description": "weight(title:fox in 0) : TermQuery",
-                            "details": []
-                        }),
-                    );
+                    let score = o.get("_score").and_then(|s| s.as_f64()).unwrap_or(1.0);
+                    let id = o
+                        .get("_id")
+                        .and_then(|i| i.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let expl = match store.indices.get(&idx_name) {
+                        Some(idx) => bm25_explanation(idx, &id, &q, score, &idx_name),
+                        None => json!({"value": score, "description": "match", "details": []}),
+                    };
+                    o.insert("_explanation".to_string(), expl);
                     o.insert("_shard".to_string(), json!(format!("[{}][0]", idx_name)));
                     o.insert("_node".to_string(), json!("node-1"));
                 }
@@ -3894,6 +4896,7 @@ pub fn handle_search(store: &mut Store, req: &Req, name: &str) -> Response {
         "sequence_number_primary_term", "seq_no_primary_term", "version", "explain",
         "profile", "min_score", "pretty", "human", "error_trace", "filter_path",
         "docvalue_fields", "fields", "stats", "include_named_queries_score",
+        "search_pipeline", "verbose_pipeline",
     ];
     for (k, _) in &req.query {
         if !allowed_params.contains(&k.as_str()) {
@@ -4038,6 +5041,7 @@ pub fn handle_search(store: &mut Store, req: &Req, name: &str) -> Response {
             "stats", "track_scores", "rest_total_hits_as_int", "allow_partial_search_results",
             "batched_reduce_size", "pre_filter_shard_size", "max_concurrent_shard_requests",
             "search_type", "request_cache", "ext", "include_named_queries_score",
+            "search_pipeline", "derived",
         ];
         {
             for (k, v) in &body {
@@ -4194,7 +5198,46 @@ pub fn handle_search(store: &mut Store, req: &Req, name: &str) -> Response {
             Err(e) => return err_response(e),
         };
     let body = Value::Object(body);
-    match run_search(store, name, &names, &body, req) {
+    let derived_snap = if body.get("derived").is_some() {
+        let mut snap = Vec::new();
+        for n in &names {
+            if let Some(idx) = store.indices.get(n) {
+                snap.push((
+                    n.clone(),
+                    idx.mappings.get("derived").cloned(),
+                    idx.doc_values.clone(),
+                ));
+            }
+        }
+        Some(snap)
+    } else {
+        None
+    };
+    if let Some(defs) = body.get("derived") {
+        for n in &names {
+            if let Some(idx) = store.indices.get_mut(n) {
+                if let Err(e) = crate::fields::apply_request_derived(idx, defs) {
+                    return err_response(e);
+                }
+            }
+        }
+    }
+    let result = run_search(store, name, &names, &body, req);
+    if let Some(snap) = derived_snap {
+        for (n, derived, doc_values) in snap {
+            if let Some(idx) = store.indices.get_mut(&n) {
+                if let Some(d) = derived {
+                    if let Some(m) = idx.mappings.as_object_mut() {
+                        m.insert("derived".to_string(), d);
+                    }
+                } else if let Some(m) = idx.mappings.as_object_mut() {
+                    m.remove("derived");
+                }
+                idx.doc_values = doc_values;
+            }
+        }
+    }
+    match result {
         Ok(mut v) => {
             if let Err(e) = crate::ingest::apply_search_response(&sp_state, &mut v) {
                 return err_response(e);

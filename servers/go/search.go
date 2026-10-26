@@ -250,6 +250,18 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request, name strin
 		query = map[string]any{"match_all": map[string]any{}}
 	}
 
+	if body["size"] == nil {
+		if _, exists := body["size"]; exists {
+			writeError(w, errParsing("Unknown key for a VALUE_NULL in [size]."))
+			return
+		}
+	}
+	if body["from"] == nil {
+		if _, exists := body["from"]; exists {
+			writeError(w, errParsing("Unknown key for a VALUE_NULL in [from]."))
+			return
+		}
+	}
 	from := intField(body, "from", 0)
 	size := intField(body, "size", 10)
 	if v := r.URL.Query().Get("from"); v != "" {
@@ -261,6 +273,14 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request, name strin
 		if n, err := strconv.Atoi(v); err == nil {
 			size = n
 		}
+	}
+	if from < 0 {
+		writeError(w, errBad(fmt.Sprintf("[from] parameter cannot be negative, found [%d]", from)))
+		return
+	}
+	if size < 0 {
+		writeError(w, errBad(fmt.Sprintf("[size] parameter cannot be negative, found [%d]", size)))
+		return
 	}
 	for _, idx := range indices {
 		window := 10000
@@ -352,13 +372,10 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request, name strin
 	}
 	page := matched[from:end]
 
-	sourceFilter, hasSource := body["_source"]
-	omitSource := false
-	if hasSource {
-		if b, ok := sourceFilter.(bool); ok {
-			omitSource = !b
-			hasSource = false
-		}
+	srcIncludes, srcExcludes, omitSource, _ := sourceFilterFromBody(body)
+	qIncludes, qExcludes, qOmit, qHas := sourceFilterFromQuery(r.URL.Query())
+	if qHas || qOmit {
+		srcIncludes, srcExcludes, omitSource = qIncludes, qExcludes, qOmit
 	}
 	highlightFields := highlightFieldsOf(body)
 	queryTokens := collectTokens(query)
@@ -378,10 +395,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request, name strin
 	}
 	hits := make([]any, 0, len(page))
 	for _, h := range page {
-		src := h.doc
-		if hasSource {
-			src = filterSource(h.doc, sourceFilter)
-		}
+		src := filterSourceDoc(h.doc, srcIncludes, srcExcludes)
 		var scoreVal any = h.score
 		if omitScores {
 			scoreVal = nil
@@ -486,7 +500,8 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request, name strin
 				for _, h := range matched {
 					aggHits = append(aggHits, aggHit{idx: h.idx, id: h.id, doc: h.doc})
 				}
-				out, err := evalAggs(aggs, aggHits, aggIdx, "")
+				typed := r.URL.Query().Get("typed_keys") != "" && r.URL.Query().Get("typed_keys") != "false"
+				out, err := evalAggs(aggs, aggHits, aggIdx, "", typed)
 				if err != nil {
 					writeError(w, err)
 					return

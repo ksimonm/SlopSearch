@@ -1115,25 +1115,503 @@ pub fn normalize_alias_def(def: &Map<String, Value>) -> Map<String, Value> {
     out
 }
 
+pub fn apply_mapper_defaults(props: &mut Map<String, Value>) {
+    for def in props.values_mut() {
+        let m = match def.as_object_mut() {
+            Some(m) => m,
+            None => continue,
+        };
+        match m.get("type").and_then(|v| v.as_str()) {
+            Some("wildcard") => {
+                m.entry("doc_values".to_string()).or_insert(Value::Bool(true));
+            }
+            Some("join") => {
+                m.entry("eager_global_ordinals".to_string())
+                    .or_insert(Value::Bool(true));
+            }
+            Some("knn_vector") => {
+                m.entry("doc_values".to_string())
+                    .or_insert(Value::Bool(true));
+            }
+            Some("search_as_you_type") => {
+                m.entry("doc_values".to_string()).or_insert(Value::Bool(false));
+                m.entry("max_shingle_size".to_string()).or_insert(Value::Number(3.into()));
+            }
+            _ => {}
+        }
+        if let Some(sub) = m.get_mut("properties").and_then(|p| p.as_object_mut()) {
+            apply_mapper_defaults(sub);
+        }
+        if let Some(sub) = m.get_mut("fields").and_then(|p| p.as_object_mut()) {
+            apply_mapper_defaults(sub);
+        }
+    }
+}
+
 pub fn validate_mapping_full(mappings: &Value) -> Result<(), ApiError> {
-    let props = match mappings.get("properties").and_then(|p| p.as_object()) {
-        Some(p) => p,
-        None => return Ok(()),
-    };
-    if let Err(reason) = validate_props_shared(props) {
+    if let Some(d) = mappings.get("dynamic") {
+        let valid = match d {
+            Value::Bool(_) => true,
+            Value::String(s) => matches!(
+                s.as_str(),
+                "true" | "false" | "strict" | "strict_allow_templates" | "false_allow_templates"
+            ),
+            _ => false,
+        };
+        if !valid {
+            let reason = "Could not convert [dynamic.dynamic] to boolean";
+            let mut e = ApiError::new(
+                "mapper_parsing_exception",
+                &format!("Failed to parse mapping [_doc]: {}", reason),
+                400,
+            );
+            e.caused_by = Some(Box::new(ApiError::new(
+                "illegal_argument_exception",
+                reason,
+                400,
+            )));
+            return Err(e);
+        }
+    }
+    if let Some(src) = mappings.get("_source").and_then(|v| v.as_object()) {
+        for k in src.keys() {
+            if !matches!(k.as_str(), "enabled" | "includes" | "excludes" | "include" | "exclude") {
+                let reason = format!(
+                    "unknown parameter [{}] on mapper [_source] of type [null]",
+                    k
+                );
+                let mut e = ApiError::new(
+                    "mapper_parsing_exception",
+                    &format!("Failed to parse mapping [_doc]: {}", reason),
+                    400,
+                );
+                e.caused_by = Some(Box::new(ApiError::new(
+                    "illegal_argument_exception",
+                    &reason,
+                    400,
+                )));
+                return Err(e);
+            }
+        }
+    }
+    if let Some(rt) = mappings.get("runtime") {
+        let reason = format!(
+            "Root mapping definition has unsupported parameters:  [runtime : {}]",
+            java_map_debug(rt)
+        );
         let mut e = ApiError::new(
             "mapper_parsing_exception",
             &format!("Failed to parse mapping [_doc]: {}", reason),
             400,
         );
         e.caused_by = Some(Box::new(ApiError::new(
-            "mapper_parsing_exception",
+            "illegal_argument_exception",
             &reason,
             400,
         )));
         return Err(e);
     }
+    let props = match mappings.get("properties").and_then(|p| p.as_object()) {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+    validate_props_meta(props)?;
+    if let Err(reason) = validate_props_shared(props) {
+        let mut e = ApiError::new(
+            "mapper_parsing_exception",
+            &format!("Failed to parse mapping [_doc]: {}", reason),
+            400,
+        );
+        let cause = if reason.starts_with("failed to parse number") {
+            "number_format_exception"
+        } else if reason.starts_with("Error parsing [format]") {
+            "illegal_argument_exception"
+        } else if reason.starts_with("Field [scaling_factor]")
+            || reason.starts_with("[scaling_factor]")
+            || reason.starts_with("min_chars")
+            || reason.starts_with("max_chars")
+        {
+            "illegal_argument_exception"
+        } else {
+            "mapper_parsing_exception"
+        };
+        e.caused_by = Some(Box::new(ApiError::new(cause, &reason, 400)));
+        return Err(e);
+    }
+    validate_alias_mappings(props)?;
+    validate_copy_to_targets(props)?;
+    validate_join_placement(props, "")?;
     Ok(())
+}
+
+fn validate_props_meta(props: &Map<String, Value>) -> Result<(), ApiError> {
+    fn walk(props: &Map<String, Value>) -> Result<(), ApiError> {
+        for (name, raw) in props {
+            if name.is_empty() || name.contains("..") {
+                let reason = "name cannot be empty string";
+                let mut e = ApiError::new(
+                    "mapper_parsing_exception",
+                    &format!("Failed to parse mapping [_doc]: {}", reason),
+                    400,
+                );
+                e.caused_by = Some(Box::new(ApiError::new(
+                    "illegal_argument_exception",
+                    reason,
+                    400,
+                )));
+                return Err(e);
+            }
+            if matches!(name.as_str(), "_id" | "_source" | "_index" | "_ignored") {
+                let reason = format!("Field [{}] is defined more than once", name);
+                let mut e = ApiError::new(
+                    "mapper_parsing_exception",
+                    &format!("Failed to parse mapping [_doc]: {}", reason),
+                    400,
+                );
+                e.caused_by = Some(Box::new(ApiError::new(
+                    "mapper_parsing_exception",
+                    &reason,
+                    400,
+                )));
+                return Err(e);
+            }
+            let Some(def) = raw.as_object() else { continue };
+            let typ = def.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if def.contains_key("enabled") && !typ.is_empty() && typ != "object" && typ != "nested" {
+                let reason = format!(
+                    "unknown parameter [enabled] on mapper [{}] of type [{}]",
+                    name, typ
+                );
+                let mut e = ApiError::new(
+                    "mapper_parsing_exception",
+                    &format!("Failed to parse mapping [_doc]: {}", reason),
+                    400,
+                );
+                e.caused_by = Some(Box::new(ApiError::new(
+                    "mapper_parsing_exception",
+                    &reason,
+                    400,
+                )));
+                return Err(e);
+            }
+            if let Some(ia) = def.get("ignore_above") {
+                if !ia.is_number() {
+                    let reason = format!(
+                        "Failed to parse mapping [_doc]: Failed to parse value [{}] as only [true] or [false] are allowed.",
+                        preview_json(ia)
+                    );
+                    let mut e = ApiError::new("mapper_parsing_exception", &reason, 400);
+                    e.caused_by = Some(Box::new(ApiError::new(
+                        "mapper_parsing_exception",
+                        "failed to parse",
+                        400,
+                    )));
+                    return Err(e);
+                }
+            }
+            if let Some(sub) = def.get("properties").and_then(|p| p.as_object()) {
+                walk(sub)?;
+            }
+        }
+        Ok(())
+    }
+    walk(props)?;
+    let joins = count_type(props, "join");
+    if joins > 1 {
+        let reason = "Field [_parent_join] is defined more than once";
+        let mut e = ApiError::new(
+            "mapper_parsing_exception",
+            &format!("Failed to parse mapping [_doc]: {}", reason),
+            400,
+        );
+        e.caused_by = Some(Box::new(ApiError::new(
+            "illegal_argument_exception",
+            reason,
+            400,
+        )));
+        return Err(e);
+    }
+    Ok(())
+}
+
+fn count_type(props: &Map<String, Value>, wanted: &str) -> usize {
+    let mut n = 0usize;
+    for raw in props.values() {
+        let Some(def) = raw.as_object() else { continue };
+        if def.get("type").and_then(|v| v.as_str()) == Some(wanted) {
+            n += 1;
+        }
+        if let Some(sub) = def.get("properties").and_then(|p| p.as_object()) {
+            n += count_type(sub, wanted);
+        }
+    }
+    n
+}
+
+fn preview_json(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn validate_copy_to_targets(props: &Map<String, Value>) -> Result<(), ApiError> {
+    for (_name, raw) in props {
+        let def = match raw.as_object() {
+            Some(d) => d,
+            None => continue,
+        };
+        let targets: Vec<String> = match def.get("copy_to") {
+            Some(Value::String(s)) => vec![s.clone()],
+            Some(Value::Array(a)) => a
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect(),
+            _ => vec![],
+        };
+        for t in targets {
+            if let Some(td) = alias_target(props, &t) {
+                if td.get("properties").is_some()
+                    || matches!(
+                        td.get("type").and_then(|v| v.as_str()),
+                        Some("object") | Some("nested")
+                    )
+                {
+                    return Err(ApiError::new(
+                        "illegal_argument_exception",
+                        &format!("Cannot copy to field [{}] since it is mapped as an object", t),
+                        400,
+                    ));
+                }
+            }
+        }
+        if let Some(sub) = def.get("properties").and_then(|p| p.as_object()) {
+            validate_copy_to_targets(sub)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_join_placement(
+    props: &Map<String, Value>,
+    prefix: &str,
+) -> Result<(), ApiError> {
+    for (name, raw) in props {
+        let def = match raw.as_object() {
+            Some(d) => d,
+            None => continue,
+        };
+        let path = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{}.{}", prefix, name)
+        };
+        if def.get("type").and_then(|v| v.as_str()) == Some("join") && !prefix.is_empty() {
+            let reason = format!(
+                "join field [{}] cannot be added inside an object or in a multi-field",
+                path
+            );
+            return Err(ApiError::new(
+                "mapper_parsing_exception",
+                &format!("Failed to parse mapping [_doc]: {}", reason),
+                400,
+            )
+            .caused_by(ApiError::new(
+                "mapper_parsing_exception",
+                &reason,
+                400,
+            )));
+        }
+        if let Some(sub) = def.get("properties").and_then(|p| p.as_object()) {
+            validate_join_placement(sub, &path)?;
+        }
+        if let Some(fields) = def.get("fields").and_then(|f| f.as_object()) {
+            for (fname, fraw) in fields {
+                if fraw
+                    .as_object()
+                    .and_then(|d| d.get("type"))
+                    .and_then(|v| v.as_str())
+                    == Some("join")
+                {
+                    let reason = format!(
+                        "join field [{}.{}] cannot be added inside an object or in a multi-field",
+                        path, fname
+                    );
+                    return Err(ApiError::new(
+                        "mapper_parsing_exception",
+                        &format!("Failed to parse mapping [_doc]: {}", reason),
+                        400,
+                    )
+                    .caused_by(ApiError::new(
+                        "mapper_parsing_exception",
+                        &reason,
+                        400,
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn alias_target<'a>(
+    props: &'a Map<String, Value>,
+    path: &str,
+) -> Option<&'a Map<String, Value>> {
+    let parts: Vec<&str> = path.split('.').collect();
+    let mut cur = props;
+    for (i, part) in parts.iter().enumerate() {
+        let def = cur.get(*part).and_then(|v| v.as_object())?;
+        if i + 1 == parts.len() {
+            return Some(def);
+        }
+        cur = def.get("properties").and_then(|p| p.as_object())?;
+    }
+    None
+}
+
+fn alias_invalid(reason: &str) -> ApiError {
+    let mut e = ApiError::new("mapper_parsing_exception", reason, 400);
+    e.caused_by = Some(Box::new(ApiError::new(
+        "mapper_parsing_exception",
+        reason,
+        400,
+    )));
+    e
+}
+
+fn validate_alias_mappings(props: &Map<String, Value>) -> Result<(), ApiError> {
+    for (name, raw) in props {
+        let def = match raw.as_object() {
+            Some(d) => d,
+            None => continue,
+        };
+        if def.get("type").and_then(|v| v.as_str()) != Some("alias") {
+            continue;
+        }
+        let path = match def.get("path").and_then(|v| v.as_str()) {
+            Some(p) if !p.is_empty() => p,
+            _ => {
+                let reason = format!(
+                    "The [path] property must be specified for field [{}].",
+                    name
+                );
+                let mut e = ApiError::new(
+                    "mapper_parsing_exception",
+                    &format!("Failed to parse mapping [_doc]: {}", reason),
+                    400,
+                );
+                e.caused_by = Some(Box::new(ApiError::new(
+                    "mapper_parsing_exception",
+                    &reason,
+                    400,
+                )));
+                return Err(e);
+            }
+        };
+        let mut unsupported = vec![];
+        for k in def.keys() {
+            if k != "type" && k != "path" {
+                let v = def.get(k).cloned().unwrap_or(Value::Null);
+                let vs = match &v {
+                    Value::Bool(b) => b.to_string(),
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                unsupported.push(format!("{} : {}", k, vs));
+            }
+        }
+        if !unsupported.is_empty() {
+            let reason = format!(
+                "Mapping definition for [{}] has unsupported parameters:  [{}]",
+                name,
+                unsupported.join(", ")
+            );
+            let mut e = ApiError::new(
+                "mapper_parsing_exception",
+                &format!("Failed to parse mapping [_doc]: {}", reason),
+                400,
+            );
+            e.caused_by = Some(Box::new(ApiError::new(
+                "mapper_parsing_exception",
+                &reason,
+                400,
+            )));
+            return Err(e);
+        }
+        let target = match alias_target(props, path) {
+            Some(d) => d,
+            None => {
+                return Err(alias_invalid(&format!(
+                    "Invalid [path] value [{}] for field alias [{}]: an alias must refer to an existing field in the mappings.",
+                    path, name
+                )))
+            }
+        };
+        if target.get("type").and_then(|v| v.as_str()) == Some("alias") {
+            return Err(alias_invalid(&format!(
+                "Invalid [path] value [{}] for field alias [{}]: an alias cannot refer to another alias.",
+                path, name
+            )));
+        }
+        if target.get("type").is_none() || target.get("properties").is_some() {
+            return Err(alias_invalid(&format!(
+                "Invalid [path] value [{}] for field alias [{}]: an alias must refer to an existing field in the mappings.",
+                path, name
+            )));
+        }
+        if let Some((scope, _)) = path.split_once('.') {
+            if let Some(scope_def) = props.get(scope).and_then(|v| v.as_object()) {
+                if scope_def.get("type").and_then(|v| v.as_str()) == Some("nested") {
+                    return Err(ApiError::new(
+                        "illegal_argument_exception",
+                        &format!(
+                            "Invalid [path] value [{}] for field alias [{}]: an alias must have the same nested scope as its target. The alias is not nested, but the target's nested scope is [{}].",
+                            path, name, scope
+                        ),
+                        400,
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn java_map_debug(v: &Value) -> String {
+    match v {
+        Value::Object(m) => {
+            let inner: Vec<String> = m
+                .iter()
+                .map(|(k, val)| format!("{}={}", k, java_map_debug(val)))
+                .collect();
+            format!("{{{}}}", inner.join(", "))
+        }
+        Value::Array(a) => {
+            let inner: Vec<String> = a.iter().map(java_map_debug).collect();
+            format!("[{}]", inner.join(", "))
+        }
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn java_meta_repr(v: &Value) -> String {
+    match v {
+        Value::Number(n) => {
+            if n.as_i64().is_some() || n.as_u64().is_some() {
+                format!("Integer[{}]", n)
+            } else {
+                format!("Double[{}]", n)
+            }
+        }
+        Value::Object(_) => format!("LinkedHashMap[{}]", java_map_debug(v)),
+        Value::Array(a) => {
+            let inner: Vec<String> = a.iter().map(java_meta_repr).collect();
+            format!("ArrayList[{}]", inner.join(", "))
+        }
+        other => format!("String[{}]", other),
+    }
 }
 
 fn validate_props_shared(props: &Map<String, Value>) -> Result<(), String> {
@@ -1149,11 +1627,247 @@ fn validate_props_shared(props: &Map<String, Value>) -> Result<(), String> {
                     t, name
                 ));
             }
+            if t == "knn_vector" && def.get("dimension").is_none() {
+                return Err(format!("Dimension value missing for vector: {}", name));
+            }
+            if t == "search_as_you_type" {
+                if let Some(n) = def.get("max_shingle_size").and_then(|v| v.as_i64()) {
+                    if !(2..=4).contains(&n) {
+                        return Err(format!(
+                            "[max_shingle_size] must be at least [2] and at most [4], got [{}]",
+                            n
+                        ));
+                    }
+                }
+            }
+            if t == "scaled_float" {
+                match def.get("scaling_factor") {
+                    None => return Err("Field [scaling_factor] is required".to_string()),
+                    Some(v) => {
+                        let f = v.as_f64().unwrap_or(0.0);
+                        if f <= 0.0 {
+                            return Err(format!(
+                                "[scaling_factor] must be a positive number, got [{:?}]",
+                                f
+                            ));
+                        }
+                    }
+                }
+            }
+            if t == "text" {
+                if let Some(ip) = def.get("index_prefixes").and_then(|v| v.as_object()) {
+                    let min = ip.get("min_chars").and_then(|v| v.as_i64()).unwrap_or(2);
+                    let max = ip.get("max_chars").and_then(|v| v.as_i64()).unwrap_or(5);
+                    if min <= 0 {
+                        return Err(format!(
+                            "min_chars [{}] must be greater than zero",
+                            min
+                        ));
+                    }
+                    if max > 20 {
+                        return Err(format!("max_chars [{}] must be less than 20", max));
+                    }
+                    if min >= max {
+                        return Err(format!(
+                            "min_chars [{}] must be less than max_chars [{}]",
+                            min, max
+                        ));
+                    }
+                }
+            }
+            if t == "flat_object" {
+                if let Some(p) = def.get("properties") {
+                    return Err(format!(
+                        "Mapping definition for [{}] has unsupported parameters:  [properties : {}]",
+                        name,
+                        java_map_debug(p)
+                    ));
+                }
+            }
+            if t == "text" && def.contains_key("null_value") {
+                return Err(format!(
+                    "unknown parameter [null_value] on mapper [{}] of type [text]",
+                    name
+                ));
+            }
+            if t == "constant_keyword" && !def.contains_key("value") {
+                return Err(format!(
+                    "Field [{}] is missing required parameter [value]",
+                    name
+                ));
+            }
+            if t == "token_count" {
+                let has_analyzer = def
+                    .get("analyzer")
+                    .and_then(|v| v.as_str())
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false);
+                if !has_analyzer {
+                    return Err(format!(
+                        "Analyzer must be set for field [{}] but wasn't.",
+                        name
+                    ));
+                }
+            }
+            if t == "match_only_text" {
+                if let Some(io) = def.get("index_options").and_then(|v| v.as_str()) {
+                    if io != "docs" {
+                        return Err(format!(
+                            "Unknown value [{}] for field [index_options] - accepted values are [docs]",
+                            io
+                        ));
+                    }
+                }
+                if def.get("norms").and_then(|v| v.as_bool()) == Some(true) {
+                    return Err("Norms cannot be enabled on for match_only_text field".to_string());
+                }
+            }
+            if t == "text" {
+                if let Some(tv) = def.get("term_vector").and_then(|v| v.as_str()) {
+                    let ok = matches!(
+                        tv,
+                        "no" | "yes"
+                            | "with_offsets"
+                            | "with_positions"
+                            | "with_positions_offsets"
+                            | "with_positions_offsets_payloads"
+                    );
+                    if !ok {
+                        return Err(format!(
+                            "Unknown value [{}] for field [term_vector] - accepted values are [no, yes, with_offsets, with_positions, with_positions_offsets, with_positions_offsets_payloads]",
+                            tv
+                        ));
+                    }
+                }
+            }
+            if matches!(t, "keyword" | "text") {
+                if let Some(io) = def.get("index_options").and_then(|v| v.as_str()) {
+                    let ok = if t == "keyword" {
+                        matches!(io, "docs" | "freqs")
+                    } else {
+                        matches!(io, "positions" | "docs" | "freqs" | "offsets")
+                    };
+                    if !ok {
+                        let accepted = if t == "keyword" {
+                            "[docs, freqs]"
+                        } else {
+                            "[positions, docs, freqs, offsets]"
+                        };
+                        return Err(format!(
+                            "Unknown value [{}] for field [index_options] - accepted values are {}",
+                            io, accepted
+                        ));
+                    }
+                }
+            }
+            if let Some(meta) = def.get("meta").and_then(|m| m.as_object()) {
+                for (_k, mv) in meta {
+                    if !mv.is_string() {
+                        return Err(format!(
+                            "[meta] values can only be strings, but got {} for field [{}]",
+                            java_meta_repr(mv),
+                            name
+                        ));
+                    }
+                }
+            }
+            if matches!(t, "date" | "date_nanos") {
+                if let Some(fmt) = def.get("format").and_then(|v| v.as_str()) {
+                    if !fmt.is_empty() {
+                        let known = [
+                            "epoch_millis",
+                            "epoch_second",
+                            "date_optional_time",
+                            "strict_date_optional_time",
+                            "strict_date_optional_time_nanos",
+                            "date_optional_time_nanos",
+                            "date_time",
+                            "strict_date_time",
+                            "basic_date_time",
+                            "strict_date",
+                            "date",
+                            "basic_date",
+                        ];
+                        for part in fmt.split("||") {
+                            let p = part.trim();
+                            if p.is_empty() || known.contains(&p) {
+                                continue;
+                            }
+                            for ch in p.chars() {
+                                if ch.is_ascii_alphabetic() && !"yMdHmsS".contains(ch) {
+                                    return Err(format!(
+                                        "Error parsing [format] on field [{}]: Invalid format: [{}]: Unknown pattern letter: {}",
+                                        name, p, ch
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if matches!(t, "integer" | "long" | "short" | "byte") {
+                if let Some(nv) = def.get("null_value") {
+                    if !nv.is_null() && !nv.is_number() {
+                        return Err(format!(
+                            "failed to parse number [{}]",
+                            java_meta_repr(nv)
+                        ));
+                    }
+                }
+            }
+        }
+        let allowed = [
+            "type", "properties", "fields", "analyzer", "search_analyzer",
+            "search_quote_analyzer", "normalizer", "index", "doc_values", "store",
+            "coerce", "ignore_malformed", "null_value", "boost", "copy_to",
+            "dynamic", "enabled", "format", "ignore_above", "index_options",
+            "norms", "similarity", "term_vector", "positions",
+            "position_increment_gap", "fielddata", "eager_global_ordinals",
+            "split_queries_on_whitespace", "max_shingle_size", "path",
+            "scaling_factor", "on_script_error", "script", "value", "meta",
+            "_meta", "index_phrases", "index_prefixes", "preserve_separator",
+            "max_input_length", "relations", "ignore_z_value", "orientation",
+            "points_only", "tree", "precision", "strategy", "distance_error_pct",
+            "doc_values", "fielddata_frequency_filter", "loading", "chunk_size",
+            "positive_score_impact", "enable_position_increments", "include_in_parent",
+            "include_in_root", "preserve_separators", "max_input_length",
+            "search_analyzer", "quote_analyzer", "index_prefixes", "index_phrases",
+            "dimension", "method", "model_id", "space_type", "ef_construction", "m",
+            "encoder",
+        ];
+        for k in def.keys() {
+            if !allowed.contains(&k.as_str()) {
+                let t = def.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                return Err(format!(
+                    "unknown parameter [{}] on mapper [{}] of type [{}]",
+                    k, name, t
+                ));
+            }
         }
         if let Some(sub) = def.get("properties").and_then(|p| p.as_object()) {
             validate_props_shared(sub)?;
         }
         if let Some(fields) = def.get("fields").and_then(|f| f.as_object()) {
+            for (fname, fraw) in fields {
+                if fname.contains('.') {
+                    return Err(format!(
+                        "Field name [{}] which is a multi field of [{}] cannot contain '.'",
+                        fname, name
+                    ));
+                }
+                if let Some(ft) = fraw
+                    .as_object()
+                    .and_then(|d| d.get("type"))
+                    .and_then(|v| v.as_str())
+                {
+                    if ft == "object" || ft == "nested" {
+                        return Err(format!(
+                            "Type [{}] cannot be used in multi field",
+                            ft
+                        ));
+                    }
+                }
+            }
             validate_props_shared(fields)?;
         }
     }
@@ -1175,4 +1889,169 @@ pub fn float_setting(idx: &Index, key: &str) -> Option<f64> {
 
 pub fn _unused(_: &dyn Fn() -> String, _: &str) -> String {
     format_number(0.0)
+}
+
+pub fn count_mapped_fields(mappings: &Value) -> usize {
+    fn walk(props: &Map<String, Value>) -> usize {
+        let mut n = 0usize;
+        for (_name, raw) in props {
+            n += 1;
+            if let Some(def) = raw.as_object() {
+                if let Some(sub) = def.get("properties").and_then(|p| p.as_object()) {
+                    n += walk(sub);
+                }
+                if let Some(fields) = def.get("fields").and_then(|f| f.as_object()) {
+                    n += fields.len();
+                }
+            }
+        }
+        n
+    }
+    mappings
+        .get("properties")
+        .and_then(|p| p.as_object())
+        .map(walk)
+        .unwrap_or(0)
+}
+
+pub fn count_nested_fields(mappings: &Value) -> usize {
+    fn walk(props: &Map<String, Value>) -> usize {
+        let mut n = 0usize;
+        for (_name, raw) in props {
+            if let Some(def) = raw.as_object() {
+                if def.get("type").and_then(|v| v.as_str()) == Some("nested") {
+                    n += 1;
+                }
+                if let Some(sub) = def.get("properties").and_then(|p| p.as_object()) {
+                    n += walk(sub);
+                }
+            }
+        }
+        n
+    }
+    mappings
+        .get("properties")
+        .and_then(|p| p.as_object())
+        .map(walk)
+        .unwrap_or(0)
+}
+
+pub fn nested_mapping_paths(mappings: &Value) -> Vec<String> {
+    fn walk(props: &Map<String, Value>, prefix: &str, out: &mut Vec<String>) {
+        for (name, raw) in props {
+            let Some(def) = raw.as_object() else { continue };
+            let path = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{}.{}", prefix, name)
+            };
+            if def.get("type").and_then(|v| v.as_str()) == Some("nested") {
+                out.push(path.clone());
+            }
+            if let Some(sub) = def.get("properties").and_then(|p| p.as_object()) {
+                walk(sub, &path, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(props) = mappings.get("properties").and_then(|p| p.as_object()) {
+        walk(props, "", &mut out);
+    }
+    out
+}
+
+pub fn count_nested_instances(mappings: &Value, source: &Value) -> usize {
+    let mut total = 0usize;
+    for path in nested_mapping_paths(mappings) {
+        if let Some(v) = crate::store::field_value(source, &path) {
+            total += match v {
+                Value::Array(a) => a.iter().filter(|e| e.is_object()).count(),
+                Value::Object(_) => 1,
+                _ => 0,
+            };
+        }
+    }
+    total
+}
+
+pub fn expand_mapping_properties(props: &mut Map<String, Value>) -> Result<(), ApiError> {
+    let mut expanded = Map::new();
+    let mut keys: Vec<String> = props.keys().cloned().collect();
+    keys.sort();
+    for k in keys {
+        let v = props.remove(&k).unwrap();
+        if k.contains('.') {
+            let parts: Vec<&str> = k.split('.').collect();
+            insert_mapping_path(&mut expanded, &parts, v)?;
+        } else {
+            if let Some(existing) = expanded.get(&k) {
+                if existing.get("properties").is_some() {
+                    let reason = format!(
+                        "can't merge a non object mapping [{}] with an object mapping",
+                        k
+                    );
+                    return Err(mapping_conflict(&reason));
+                }
+            }
+            expanded.insert(k, v);
+        }
+    }
+    for v in expanded.values_mut() {
+        if let Some(def) = v.as_object_mut() {
+            if let Some(sub) = def.get_mut("properties").and_then(|p| p.as_object_mut()) {
+                expand_mapping_properties(sub)?;
+            }
+        }
+    }
+    *props = expanded;
+    Ok(())
+}
+
+fn insert_mapping_path(
+    props: &mut Map<String, Value>,
+    parts: &[&str],
+    def: Value,
+) -> Result<(), ApiError> {
+    if parts.len() == 1 {
+        if let Some(existing) = props.get(parts[0]) {
+            if existing.get("properties").is_some() {
+                let reason = format!(
+                    "can't merge a non object mapping [{}] with an object mapping",
+                    parts[0]
+                );
+                return Err(mapping_conflict(&reason));
+            }
+        }
+        props.insert(parts[0].to_string(), def);
+        return Ok(());
+    }
+    let entry = props
+        .entry(parts[0].to_string())
+        .or_insert_with(|| serde_json::json!({"properties": {}}));
+    if entry.get("properties").is_none() {
+        let reason = format!(
+            "can't merge a non object mapping [{}] with an object mapping",
+            parts[0]
+        );
+        return Err(mapping_conflict(&reason));
+    }
+    let sub = entry
+        .get_mut("properties")
+        .and_then(|p| p.as_object_mut())
+        .unwrap();
+    insert_mapping_path(sub, &parts[1..], def)
+}
+
+fn mapping_conflict(reason: &str) -> ApiError {
+    let mut e = ApiError::new(
+        "mapper_parsing_exception",
+        &format!("Failed to parse mapping [_doc]: {}", reason),
+        400,
+    );
+    e.caused_by = Some(Box::new(ApiError::new(
+        "illegal_argument_exception",
+        reason,
+        400,
+    )));
+    e
 }

@@ -1034,7 +1034,11 @@ func (s *Server) handleGetDoc(w http.ResponseWriter, r *http.Request, name, id s
 		writeJSON(w, 404, map[string]any{"_index": idx.Name, "_id": id, "found": false})
 		return
 	}
-	resp := map[string]any{"_index": idx.Name, "_id": id, "_version": 1, "found": true, "_source": doc}
+	resp := map[string]any{"_index": idx.Name, "_id": id, "_version": 1, "found": true}
+	includes, excludes, omit, _ := sourceFilterFromQuery(r.URL.Query())
+	if !omit {
+		resp["_source"] = filterSourceDoc(doc, includes, excludes)
+	}
 	if r2, ok := idx.Routing[id]; ok && r2 != "" {
 		resp["_routing"] = r2
 	}
@@ -1062,7 +1066,8 @@ func (s *Server) handleGetSource(w http.ResponseWriter, r *http.Request, name, i
 		writeJSON(w, 404, map[string]any{"_index": idx.Name, "_id": id, "found": false})
 		return
 	}
-	writeJSON(w, 200, doc)
+	includes, excludes, _, _ := sourceFilterFromQuery(r.URL.Query())
+	writeJSON(w, 200, filterSourceDoc(doc, includes, excludes))
 }
 
 func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request, name, id string) {

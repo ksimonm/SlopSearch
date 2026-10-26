@@ -170,14 +170,55 @@ fn completion_suggester(spec: &Map<String, Value>, body: &Map<String, Value>, id
     let field = body.get("field").and_then(value_to_string).unwrap_or_default();
     let prefix = suggest_text(spec);
     let lower = prefix.to_lowercase();
+    let def = crate::eval::mapping_field_def(idx, &field).cloned().unwrap_or_default();
+    let preserve = def
+        .get("preserve_separators")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let max_len = def
+        .get("max_input_length")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(50)
+        .max(1) as usize;
+    let fuzzy = body
+        .get("fuzzy")
+        .and_then(|v| v.as_object())
+        .and_then(|f| f.get("fuzziness"))
+        .and_then(to_f64)
+        .or_else(|| {
+            spec.get("fuzzy")
+                .and_then(|v| v.as_object())
+                .and_then(|f| f.get("fuzziness"))
+                .and_then(to_f64)
+        })
+        .unwrap_or(0.0);
+    let size = body
+        .get("size")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(10)
+        .max(0) as usize;
+    let norm = |s: &str| -> String {
+        let lower = s.to_lowercase();
+        if preserve {
+            lower
+        } else {
+            lower.chars().filter(|c| c.is_alphanumeric()).collect()
+        }
+    };
+    let want = norm(&lower);
 
     let mut entries: Vec<(String, f64, String)> = vec![];
     for id in &idx.order {
         let doc = match idx.docs.get(id) { Some(d) => d, None => continue };
         if let Some(v) = field_value(doc, &field) {
-            for (text, weight) in completion_inputs(v) {
-                if text.to_lowercase().starts_with(&lower) {
-                    entries.push((text, weight, id.clone()));
+            for (raw_text, weight) in completion_inputs(v) {
+                let text: String = raw_text.chars().take(max_len).collect();
+                if norm(&text).starts_with(&want) {
+                    let mut score = if weight > 0.0 { weight } else { 1.0 };
+                    if fuzzy > 0.0 {
+                        score *= 1.0 + fuzzy * 2.0;
+                    }
+                    entries.push((text, score, id.clone()));
                 }
             }
         }
@@ -186,6 +227,7 @@ fn completion_suggester(spec: &Map<String, Value>, body: &Map<String, Value>, id
 
     let options: Vec<Value> = entries
         .iter()
+        .take(size)
         .map(|(text, weight, id)| json!({"text": text, "_score": weight, "_id": id}))
         .collect();
     json!({"text": prefix, "offset": 0, "length": prefix.len(), "options": options})

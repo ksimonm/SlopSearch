@@ -120,7 +120,7 @@ fn index_metrics(idx: &crate::store::Index, requested: Option<&Vec<String>>) -> 
                 m["total_data_set_size_in_bytes"] = json!(idx.store_bytes());
             }
             "indexing" => {
-                m["index_total"] = json!(idx.index_total);
+                m["index_total"] = json!(idx.index_total.saturating_sub(idx.delete_total));
                 m["delete_total"] = json!(idx.delete_total);
             }
             "segments" => {

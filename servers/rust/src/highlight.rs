@@ -517,9 +517,8 @@ fn build_fragments(text: &str, terms: &[String], c: &Cfg) -> Vec<String> {
                 0
             } else {
                 let mut si = mi.saturating_sub(1);
-                while si > 0 && ws[si].start < consumed_end {
+                if si > 0 && ws[si].start < consumed_end {
                     si += 1;
-                    break;
                 }
                 ws[si].start
             };
@@ -680,7 +679,8 @@ pub fn render(
             names.push(pattern.clone());
         }
         for name in names {
-            let ftype = mapping_type(idx, &name).unwrap_or_default();
+            let target = crate::eval::resolve_alias_field(idx, &name);
+            let ftype = mapping_type(idx, &target).unwrap_or_default();
             if !is_text_type(&ftype) {
                 continue;
             }
@@ -715,7 +715,7 @@ pub fn render(
                     cfg.typ, name
                 )));
             }
-            let text = match field_value(doc, &name).and_then(text_of) {
+            let text = match field_value(doc, &target).and_then(text_of) {
                 Some(t) => t,
                 None => continue,
             };

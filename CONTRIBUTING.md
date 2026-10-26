@@ -25,9 +25,9 @@ Rules:
 - Go: standard library only, `gofmt` clean. Rust: keep `cargo build` free of new warnings
   in the code you touch.
 
-Good first areas: text analysis (`test_51`, `test_80`) is the weakest in both servers,
-and a test that passes in one server but not the other usually has a ready-made reference
-implementation next door.
+Good areas to pick up: text analysis (`test_51`, `test_80`) and Painless (`test_43`)
+are the open work in the Rust server. In the Go server most areas are open, and the Rust
+server is a ready-made reference for how they behave.
 
 ## Adding or fixing a test
 

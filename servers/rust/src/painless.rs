@@ -35,6 +35,9 @@ impl<'a, 'b> ScriptEnv<'a, 'b> {
             }
             return vals[0].clone();
         }
+        if path == "_score" || path == "score" {
+            return self.params.get("__score").cloned().unwrap_or(Value::Null);
+        }
         if path == "ctx._index" {
             return self.params.get("__ctx_index").cloned().unwrap_or(Value::Null);
         }
@@ -603,6 +606,36 @@ pub fn script_params_of(bm: &serde_json::Map<String, Value>) -> serde_json::Map<
         .unwrap_or_default()
 }
 
+fn script_doc_guard(src: &str, c: &QueryCtx) -> Result<(), String> {
+    let bytes = src.as_bytes();
+    let mut i = 0usize;
+    while let Some(pos) = src[i..].find("doc[") {
+        let start = i + pos + 4;
+        let mut j = start;
+        while j < bytes.len() && bytes[j] == b' ' {
+            j += 1;
+        }
+        if j < bytes.len() && (bytes[j] == b'\'' || bytes[j] == b'"') {
+            let q = bytes[j];
+            j += 1;
+            let fstart = j;
+            while j < bytes.len() && bytes[j] != q {
+                j += 1;
+            }
+            let field = &src[fstart..j];
+            let mut k = j + 1;
+            if k < bytes.len() && bytes[k] == b']' {
+                k += 1;
+            }
+            if src[k..].starts_with(".value") && !c.has_field(field) {
+                return Err(format!("No field found for [{}] in mapping", field));
+            }
+        }
+        i = start;
+    }
+    Ok(())
+}
+
 impl<'a> QueryCtx<'a> {
     pub fn eval_script_query(&self, body: &Value) -> Result<(bool, f64), crate::errors::ApiError> {
         let bm = match body.as_object() {
@@ -644,24 +677,27 @@ impl<'a> QueryCtx<'a> {
             params = script_params_of(sm);
         }
         let env = ScriptEnv { c: self, params };
+        if let Err(e) = script_doc_guard(&src, self) {
+            return Err(crate::eval_extra::shard_error(
+                400,
+                "script_exception",
+                &format!("failed to create query: {}", e),
+            ));
+        }
         match env.eval_script_expression(&src) {
             Ok(v) => {
                 if truthy(&v) {
-                    Ok((true, 1.0))
+                    let boost = bm.get("boost").and_then(to_f64).unwrap_or(1.0);
+                    Ok((true, boost))
                 } else {
                     Ok((false, 0.0))
                 }
             }
-            Err(e) => Err(crate::errors::ApiError::new(
-                "search_phase_execution_exception",
+            Err(e) => Err(crate::eval_extra::shard_error(
+                400,
+                "script_exception",
                 &format!("failed to create query: {}", e),
-                400,
-            )
-            .caused_by(crate::errors::ApiError::new(
-                "illegal_argument_exception",
-                &e,
-                400,
-            ))),
+            )),
         }
     }
 
@@ -678,7 +714,7 @@ impl<'a> QueryCtx<'a> {
                 ))
             }
         };
-        let (matched, _) = self.eval(inner)?;
+        let (matched, base_score) = self.eval(inner)?;
         if !matched {
             return Ok((false, 0.0));
         }
@@ -687,23 +723,39 @@ impl<'a> QueryCtx<'a> {
             None => return Ok((true, 1.0)),
         };
         let src = sm.get("source").and_then(|s| s.as_str()).unwrap_or("");
-        let env = ScriptEnv {
-            c: self,
-            params: script_params_of(sm),
-        };
-        match env.eval_script_expression(src) {
-            Ok(v) => Ok((true, script_float(&v))),
-            Err(e) => Err(crate::errors::ApiError::new(
-                "search_phase_execution_exception",
+        let mut params = script_params_of(sm);
+        params.insert("__score".to_string(), serde_json::json!(base_score));
+        let env = ScriptEnv { c: self, params };
+        if let Err(e) = script_doc_guard(src, self) {
+            return Err(crate::eval_extra::shard_error(
+                400,
+                "script_exception",
                 &format!("failed to create query: {}", e),
-                400,
-            )
-            .caused_by(crate::errors::ApiError::new(
-                "illegal_argument_exception",
-                &e,
-                400,
-            ))),
+            ));
         }
+        let score = match env.eval_script_expression(src) {
+            Ok(v) => script_float(&v),
+            Err(e) => {
+                return Err(crate::eval_extra::shard_error(
+                    400,
+                    "script_exception",
+                    &format!("failed to create query: {}", e),
+                ))
+            }
+        };
+        if !score.is_finite() || score < 0.0 {
+            return Err(crate::eval_extra::shard_error(
+                400,
+                "illegal_argument_exception",
+                &format!("script_score script returned an invalid score [{:?}]", score),
+            ));
+        }
+        if let Some(min) = bm.get("min_score").and_then(to_f64) {
+            if score < min {
+                return Ok((false, 0.0));
+            }
+        }
+        Ok((true, score))
     }
 }
 

@@ -53,7 +53,7 @@ fn check_dynamic_strict(
             return Some(ApiError::new(
                 "strict_dynamic_mapping_exception",
                 &format!(
-                    "dynamic introduction of [{}] within [_doc] is not allowed",
+                    "mapping set to strict, dynamic introduction of [{}] within [_doc] is not allowed",
                     k
                 ),
                 400,
@@ -63,16 +63,34 @@ fn check_dynamic_strict(
     None
 }
 
-fn object_depth_exceeded(v: &Value, depth: usize) -> bool {
+fn object_depth_exceeded(v: &Value, depth: usize, limit: usize) -> bool {
+    if depth > limit {
+        return true;
+    }
+    match v {
+        Value::Object(m) => m.values().any(|c| object_depth_exceeded(c, depth + 1, limit)),
+        Value::Array(a) => a.iter().any(|c| object_depth_exceeded(c, depth + 1, limit)),
+        _ => false,
+    }
+}
+
+fn field_name_too_long(v: &Value, limit: usize) -> Option<String> {
     match v {
         Value::Object(m) => {
-            if depth > 20 {
-                return true;
+            for (k, c) in m {
+                for part in k.split('.') {
+                    if part.len() > limit {
+                        return Some(part.to_string());
+                    }
+                }
+                if let Some(found) = field_name_too_long(c, limit) {
+                    return Some(found);
+                }
             }
-            m.values().any(|c| object_depth_exceeded(c, depth + 1))
+            None
         }
-        Value::Array(a) => a.iter().any(|c| object_depth_exceeded(c, depth + 1)),
-        _ => false,
+        Value::Array(a) => a.iter().find_map(|c| field_name_too_long(c, limit)),
+        _ => None,
     }
 }
 
@@ -153,6 +171,95 @@ fn parse_index_body(req: &Req) -> Result<Map<String, Value>, ApiError> {
             Err(ApiError::new("mapper_parsing_exception", "failed to parse", 400).caused_by(cause))
         }
     }
+}
+
+fn percolator_query_fields(q: &Map<String, Value>, out: &mut Vec<String>) {
+    for (k, v) in q {
+        match k.as_str() {
+            "bool" => {
+                if let Some(bm) = v.as_object() {
+                    for key in ["must", "should", "filter", "must_not"] {
+                        if let Some(cl) = bm.get(key) {
+                            let items: Vec<&Value> = match cl {
+                                Value::Array(a) => a.iter().collect(),
+                                other => vec![other],
+                            };
+                            for item in items {
+                                if let Some(sub) = item.as_object() {
+                                    percolator_query_fields(sub, out);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "term" | "terms" | "range" | "match" | "match_phrase" | "prefix"
+            | "wildcard" | "regexp" | "fuzzy" | "exists" | "terms_set" | "match_bool_prefix"
+            | "match_phrase_prefix" | "query_string" | "simple_query_string" => {
+                if let Some(bm) = v.as_object() {
+                    for key in bm.keys() {
+                        if key != "boost" && key != "_name" && key != "case_insensitive" {
+                            out.push(key.clone());
+                            break;
+                        }
+                    }
+                }
+            }
+            "nested" => {
+                if let Some(bm) = v.as_object() {
+                    if let Some(p) = bm.get("path").and_then(|x| x.as_str()) {
+                        out.push(p.to_string());
+                    }
+                    if let Some(inner) = bm.get("query").and_then(|x| x.as_object()) {
+                        percolator_query_fields(inner, out);
+                    }
+                }
+            }
+            "constant_score" => {
+                if let Some(bm) = v.as_object() {
+                    if let Some(f) = bm.get("filter").and_then(|x| x.as_object()) {
+                        percolator_query_fields(f, out);
+                    }
+                }
+            }
+            "function_score" => {
+                if let Some(bm) = v.as_object() {
+                    if let Some(f) = bm.get("query").and_then(|x| x.as_object()) {
+                        percolator_query_fields(f, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn validate_percolator_fields(idx: &Index, q: &Map<String, Value>) -> Result<(), ApiError> {
+    if let Err(e) = crate::eval::validate_query(idx, q) {
+        return Err(ApiError::new(
+            "mapper_parsing_exception",
+            "failed to parse",
+            400,
+        )
+        .caused_by(ApiError::new(&e.typ, &e.reason, 400)));
+    }
+    let mut fields = Vec::new();
+    percolator_query_fields(q, &mut fields);
+    for f in fields {
+        if crate::eval::mapping_field_def(idx, &f).is_none() {
+            return Err(ApiError::new(
+                "mapper_parsing_exception",
+                "failed to parse",
+                400,
+            )
+            .caused_by(ApiError::new(
+                "query_shard_exception",
+                &format!("No field mapping can be found for the field with name [{}]", f),
+                400,
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn bad_param(req: &Req) -> Option<Response> {
@@ -305,24 +412,49 @@ pub fn handle_index_doc(store: &mut Store, req: &Req, name: &str, id: &str, op_t
         Ok(b) => b,
         Err(e) => return err_response(e),
     };
-    if object_depth_exceeded(&Value::Object(body.clone()), 1) {
-        let reason = "The object depth limit [20] was exceeded";
+    let depth_limit = crate::store::setting_int(
+        &store.indices[&target].settings,
+        "mapping.depth.limit",
+    )
+    .unwrap_or(20);
+    if object_depth_exceeded(&Value::Object(body.clone()), 0, depth_limit as usize) {
+        let reason = format!(
+            "The depth of the field has exceeded the allowed limit of [{}]. This limit can be set by changing the [index.mapping.depth.limit] index level setting.",
+            depth_limit
+        );
         let mut e = ApiError::new("mapper_parsing_exception", "failed to parse", 400)
-            .caused_by(ApiError::new("parse_exception", reason, 400));
-        e.root_cause = Some(Box::new(ApiError::new("parse_exception", reason, 400)));
+            .caused_by(ApiError::new("parse_exception", &reason, 400));
+        e.root_cause = Some(Box::new(ApiError::new("parse_exception", &reason, 400)));
         return err_response(e);
     }
     if let Some(field) = mixed_array_path(&Value::Object(body.clone()), "") {
-        return err_response(ApiError::new(
-            "illegal_argument_exception",
-            &format!("can't merge a non object mapping [{}] with an object mapping", field),
-            400,
-        ));
+        let disabled = store.indices[&target]
+            .mappings
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .and_then(|p| p.get(&field))
+            .and_then(|d| d.get("enabled"))
+            .and_then(|v| v.as_bool())
+            == Some(false);
+        if !disabled {
+            return err_response(ApiError::new(
+                "illegal_argument_exception",
+                &format!("can't merge a non object mapping [{}] with an object mapping", field),
+                400,
+            ));
+        }
     }
     {
         let idx = &store.indices[&target];
         let rp = req.param("routing").unwrap_or("");
         if routing_required(idx) && rp.is_empty() {
+            if id.is_empty() {
+                return err_response(ApiError::new(
+                    "null_pointer_exception",
+                    "Cannot invoke \"String.length()\" because \"id\" is null",
+                    500,
+                ));
+            }
             return err_response(ApiError::new(
                 "routing_missing_exception",
                 &format!("routing is required for [{}]/[{}]", target, id),
@@ -364,7 +496,9 @@ pub fn handle_index_doc(store: &mut Store, req: &Req, name: &str, id: &str, op_t
     }
     let mut pipeline_routing = String::new();
     let mut pipeline_id = String::new();
+    let mut pipeline_applied = false;
     if let Some(pname) = effective {
+        pipeline_applied = true;
         match crate::ingest::run_ingest_pipeline(store, &pname, body.clone(), pmeta.clone()) {
             Ok(out) => {
                 if out.dropped {
@@ -407,6 +541,7 @@ pub fn handle_index_doc(store: &mut Store, req: &Req, name: &str, id: &str, op_t
         let _ = crate::admin::create_index_internal(store, &target, &Map::new(), false);
     }
     if let Some(fpname) = crate::ingest::final_ingest_pipeline(store, &target) {
+        pipeline_applied = true;
         let mut fmeta = pmeta.clone();
         fmeta.insert("_index".to_string(), json!(target));
         match crate::ingest::run_ingest_pipeline(store, &fpname, body.clone(), fmeta) {
@@ -470,14 +605,9 @@ pub fn handle_index_doc(store: &mut Store, req: &Req, name: &str, id: &str, op_t
             .get("dynamic")
             .and_then(|d| d.as_str())
             .map(|s| s.to_string());
-        let dynamic_false = matches!(idx.mappings.get("dynamic"), Some(Value::Bool(false)))
-            || dynamic.as_deref() == Some("false");
         let props = crate::store::ensure_properties(&mut idx.mappings);
         if let Some(derr) = check_dynamic_strict(dynamic.clone(), props, &body) {
             return err_response(derr);
-        }
-        if !dynamic_false {
-            crate::store::merge_mapping(props, &body);
         }
         idx.ensure_field_types();
     }
@@ -489,8 +619,82 @@ pub fn handle_index_doc(store: &mut Store, req: &Req, name: &str, id: &str, op_t
         id.to_string()
     };
     let idx = store.indices.get_mut(&target).unwrap();
+    if let Some(jf) = crate::eval_extra::find_join_field(idx) {
+        let is_child = body
+            .get(&jf)
+            .and_then(|v| v.as_object())
+            .map(|o| o.contains_key("parent"))
+            .unwrap_or(false);
+        if is_child
+            && req.param("routing").unwrap_or("").is_empty()
+            && pipeline_routing.is_empty()
+        {
+            return err_response(
+                ApiError::new("mapper_parsing_exception", "failed to parse", 400).caused_by(
+                    ApiError::new(
+                        "illegal_argument_exception",
+                        &format!("[routing] is missing for join field [{}]", jf),
+                        400,
+                    ),
+                ),
+            );
+        }
+    }
+    if let Some(props) = idx.mappings.get("properties").and_then(|p| p.as_object()) {
+        for (fname, fdef) in props {
+            if fdef.get("type").and_then(|t| t.as_str()) != Some("percolator") {
+                continue;
+            }
+            if let Some(qv) = body.get(fname) {
+                match qv.as_object() {
+                    Some(q) => {
+                        if let Err(e) = validate_percolator_fields(idx, q) {
+                            return err_response(e);
+                        }
+                    }
+                    None => {
+                        let reason = "[_na] query malformed, must start with start_object";
+                        return err_response(
+                            ApiError::new("mapper_parsing_exception", "failed to parse", 400)
+                                .caused_by(ApiError::new("parsing_exception", reason, 400)),
+                        );
+                    }
+                }
+            }
+        }
+    }
     if let Err(e) = crate::fields::compute_doc_values(idx, &doc_id, &mut body) {
         return err_response(e);
+    }
+    let field_limit = crate::store::setting_int(&idx.settings, "mapping.total_fields.limit")
+        .unwrap_or(1000);
+    if crate::shared::count_mapped_fields(&idx.mappings) as i64 > field_limit {
+        return err_response(ApiError::bad(&format!(
+            "Limit of total fields [{}] has been exceeded",
+            field_limit
+        )));
+    }
+    let name_limit = crate::store::setting_int(&idx.settings, "mapping.field_name_length.limit")
+        .unwrap_or(512);
+    if let Some(name) = field_name_too_long(&Value::Object(body.clone()), name_limit as usize) {
+        return err_response(ApiError::bad(&format!(
+            "Field name [{}] is longer than the limit of [{}] characters",
+            name, name_limit
+        )));
+    }
+    let nested_limit = crate::store::setting_int(&idx.settings, "mapping.nested_objects.limit")
+        .unwrap_or(10000);
+    if crate::shared::count_nested_instances(&idx.mappings, &Value::Object(body.clone())) as i64
+        > nested_limit
+    {
+        return err_response(ApiError::new(
+            "mapper_parsing_exception",
+            &format!(
+                "The number of nested documents has exceeded the allowed limit of [{}]. This limit can be set by changing the [index.mapping.nested_objects.limit] index level setting.",
+                nested_limit
+            ),
+            400,
+        ));
     }
     if op_type != "create" && op_type != "index" && !op_type.is_empty() {
         return err_response(ApiError::bad(&format!(
@@ -533,7 +737,7 @@ pub fn handle_index_doc(store: &mut Store, req: &Req, name: &str, id: &str, op_t
     idx.versions.insert(doc_id.clone(), planned_version);
     idx.seq_nos.insert(doc_id.clone(), seq);
     idx.docs.insert(doc_id.clone(), Value::Object(body.clone()));
-    let raw_store = if !req.body.is_empty() {
+    let raw_store = if !pipeline_applied && !req.body.is_empty() {
         req.body.clone()
     } else {
         serde_json::to_vec(&Value::Object(body.clone())).unwrap_or_default()
@@ -626,17 +830,67 @@ fn is_stored_field(idx: &Index, name: &str) -> bool {
 }
 
 fn stored_fields_json(idx: &Index, doc: &Value, spec: &str) -> Map<String, Value> {
+    let patterns: Vec<String> = spec
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    let mut paths = Vec::new();
+    fn walk(
+        props: &Map<String, Value>,
+        prefix: &str,
+        patterns: &[String],
+        out: &mut Vec<String>,
+    ) {
+        for (name, raw) in props {
+            let Some(def) = raw.as_object() else { continue };
+            let path = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{}.{}", prefix, name)
+            };
+            if def.get("store").and_then(|v| v.as_bool()) == Some(true)
+                && patterns
+                    .iter()
+                    .any(|p| p == "*" || p == &path || crate::shared::wildcard_match(p, &path))
+            {
+                out.push(path.clone());
+            }
+            if let Some(sub) = def.get("properties").and_then(|p| p.as_object()) {
+                walk(sub, &path, patterns, out);
+            }
+        }
+    }
+    if let Some(props) = idx.mappings.get("properties").and_then(|p| p.as_object()) {
+        walk(props, "", &patterns, &mut paths);
+    }
     let mut out = Map::new();
-    for name in spec.split(',').filter(|s| !s.is_empty()) {
-        if name == "*" {
-            continue;
-        }
-        if !is_stored_field(idx, name) {
-            continue;
-        }
-        if let Some(v) = crate::store::field_value(doc, name) {
-            let vals = if v.is_array() { v.clone() } else { json!([v]) };
-            out.insert(name.to_string(), vals);
+    for name in paths {
+        if let Some(v) = crate::store::field_value(doc, &name) {
+            let fdef = crate::eval::mapping_field_def(idx, &name);
+            let ftype = fdef
+                .as_ref()
+                .and_then(|d| d.get("type"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            let fmt = |x: &Value| -> Value {
+                if matches!(ftype, "date" | "date_nanos") {
+                    if let Some(s) = x.as_str() {
+                        if let Some(d) = fdef.as_ref() {
+                            if let Some(ms) = crate::fields::parse_date_any(d, s) {
+                                return crate::search::format_stored_value("date", &json!(ms));
+                            }
+                        }
+                    }
+                }
+                x.clone()
+            };
+            let vals = if v.is_array() {
+                Value::Array(v.as_array().unwrap().iter().map(fmt).collect())
+            } else {
+                json!([fmt(v)])
+            };
+            out.insert(name, vals);
         }
     }
     out
@@ -683,10 +937,13 @@ pub fn handle_get_doc(store: &mut Store, req: &Req, name: &str, id: &str) -> Res
     if !realtime && idx.pending.contains_key(id) {
         return missing();
     }
-    let doc = match idx.docs.get(id) {
+    let mut doc = match idx.docs.get(id) {
         Some(d) => d.clone(),
         None => return missing(),
     };
+    if let Some(m) = doc.as_object_mut() {
+        m.remove("_ignored");
+    }
     let version = idx.versions.get(id).copied().unwrap_or(1);
     if let Some(v) = req.param("version") {
         let want: i64 = v.parse().unwrap_or(-1);
@@ -708,11 +965,24 @@ pub fn handle_get_doc(store: &mut Store, req: &Req, name: &str, id: &str) -> Res
     resp.insert("_seq_no".to_string(), json!(idx.seq_nos.get(id).copied().unwrap_or(0)));
     resp.insert("_primary_term".to_string(), json!(1));
     resp.insert("found".to_string(), json!(true));
+    if let Some(ign) = idx.doc_ignored.get(id) {
+        let mut sorted = ign.clone();
+        sorted.sort();
+        resp.insert(
+            "_ignored".to_string(),
+            json!(sorted.iter().map(|f| json!(f)).collect::<Vec<_>>()),
+        );
+    }
     let stored_spec = req.param("stored_fields").unwrap_or("");
+    let req_filter = req.param("_source").is_some()
+        || req.param("_source_includes").is_some()
+        || req.param("_source_excludes").is_some();
     let source_spec = if !stored_spec.is_empty() && req.param("_source").is_none() {
         None
-    } else {
+    } else if req_filter {
         get_source_spec(req)
+    } else {
+        crate::search::mapping_source_spec(idx).or_else(|| get_source_spec(req))
     };
     let source_explicit = req.param("_source").map(|v| v == "true").unwrap_or(false);
     if source_enabled(idx) {
@@ -732,8 +1002,15 @@ pub fn handle_get_doc(store: &mut Store, req: &Req, name: &str, id: &str) -> Res
     }
     let has_filter = req.param("_source").is_some()
         || req.param("_source_includes").is_some()
-        || req.param("_source_excludes").is_some();
-    if !has_filter && stored_spec.is_empty() && source_enabled(idx) {
+        || req.param("_source_excludes").is_some()
+        || crate::search::mapping_source_spec(idx).is_some();
+    let has_routing = idx.routing.get(id).map(|r| !r.is_empty()).unwrap_or(false);
+    if !has_filter
+        && !has_routing
+        && stored_spec.is_empty()
+        && source_enabled(idx)
+        && !idx.doc_ignored.contains_key(id)
+    {
         if let Some(raw) = idx.raw_sources.get(id) {
             let prefix = format!(
                 "{{\"_index\":{},\"_id\":{},\"_version\":{},\"_seq_no\":{},\"_primary_term\":1,\"found\":true,\"_source\":",
@@ -1197,6 +1474,10 @@ pub fn handle_update_doc(store: &mut Store, req: &Req, name: &str, id: &str) -> 
             }
         }
     }
+    let default_pipeline = match crate::ingest::effective_ingest_pipeline(store, &target, "") {
+        Ok(p) => p,
+        Err(e) => return err_response(e),
+    };
     let idx = match store.indices.get_mut(&target) {
         Some(i) => i,
         None => return err_response(crate::shared::err_index_not_found_named(&target)),
@@ -1296,6 +1577,7 @@ pub fn handle_update_doc(store: &mut Store, req: &Req, name: &str, id: &str) -> 
         }
         if result == "deleted" {
             store.indices.get_mut(&target).unwrap().docs.remove(id);
+            store.indices.get_mut(&target).unwrap().raw_sources.remove(id);
             crate::fields::remove_doc_values(store.indices.get_mut(&target).unwrap(), id);
             let idx = store.indices.get_mut(&target).unwrap();
             new_version = old_version + 1;
@@ -1305,6 +1587,23 @@ pub fn handle_update_doc(store: &mut Store, req: &Req, name: &str, id: &str) -> 
             idx.index_total += 1;
             idx.delete_total += 1;
         } else if result == "updated" {
+            if let Some(pname) = &default_pipeline {
+                let mut meta = Map::new();
+                meta.insert("_index".to_string(), json!(target));
+                meta.insert("_id".to_string(), json!(id));
+                match crate::ingest::run_ingest_pipeline(store, pname, cur.clone(), meta) {
+                    Ok(out) => {
+                        if out.dropped {
+                            return json_response(200, json!({"_index": target, "_id": id,
+                                "_version": old_version, "result": "noop",
+                                "_shards": {"total": 0, "successful": 0, "failed": 0},
+                                "_seq_no": new_seq, "_primary_term": 1}));
+                        }
+                        cur = out.source;
+                    }
+                    Err(e) => return err_response(e),
+                }
+            }
             let idx = store.indices.get_mut(&target).unwrap();
             if let Err(e) = crate::fields::compute_doc_values(idx, id, &mut cur) {
                 return err_response(e);
@@ -1315,6 +1614,7 @@ pub fn handle_update_doc(store: &mut Store, req: &Req, name: &str, id: &str) -> 
             idx.seq_nos.insert(id.to_string(), new_seq);
             idx.index_total += 1;
             idx.docs.insert(id.to_string(), Value::Object(cur.clone()));
+            idx.raw_sources.insert(id.to_string(), serde_json::to_vec(&Value::Object(cur.clone())).unwrap_or_default());
             if req.bool_param("refresh") || req.param("refresh") == Some("wait_for") {
                 idx.pending.remove(id);
             } else {
@@ -1376,6 +1676,7 @@ pub fn handle_update_doc(store: &mut Store, req: &Req, name: &str, id: &str) -> 
         idx.seq_nos.insert(id.to_string(), seq);
         idx.index_total += 1;
         idx.docs.insert(id.to_string(), Value::Object(base.clone()));
+        idx.raw_sources.insert(id.to_string(), serde_json::to_vec(&Value::Object(base.clone())).unwrap_or_default());
         if req.bool_param("refresh") || req.param("refresh") == Some("wait_for") {
             idx.pending.remove(id);
         } else {
@@ -1684,6 +1985,14 @@ pub fn parse_q_param(q: &str) -> Value {
         if idx > 0 {
             let field = &q[..idx];
             let mut value = q[idx + 1..].trim();
+            if field == "_id" {
+                let vals: Vec<Value> = value
+                    .split(',')
+                    .filter(|v| !v.is_empty())
+                    .map(|v| Value::String(v.to_string()))
+                    .collect();
+                return json!({"ids": {"values": vals}});
+            }
             if value.starts_with('[') || value.starts_with('{') {
                 let inc_lo = value.starts_with('[');
                 let inc_hi = value.ends_with(']');
@@ -1787,6 +2096,34 @@ pub fn handle_count(store: &mut Store, req: &Req, name: &str) -> Response {
         }
     }
     let match_all = query.get("match_all").is_some();
+    for n in &names {
+        let idx = &store.indices[n];
+        let qm = query.as_object().cloned().unwrap_or_default();
+        if let Err(e) = crate::eval::validate_query(idx, &qm) {
+            if e.typ == "parsing_exception" && e.reason.starts_with("unknown query") {
+                return err_response(e);
+            }
+            let base = e
+                .root_cause
+                .as_ref()
+                .map(|r| r.reason.clone())
+                .unwrap_or_else(|| e.reason.clone());
+            let reason = if base.starts_with("failed to create query") {
+                base
+            } else {
+                format!("failed to create query: {}", base)
+            };
+            let mut out = ApiError::new(
+                "search_phase_execution_exception",
+                "all shards failed",
+                400,
+            );
+            let cause = ApiError::new("query_shard_exception", &reason, 400);
+            out.root_cause = Some(Box::new(cause.clone()));
+            out.caused_by = Some(Box::new(cause));
+            return err_response(out);
+        }
+    }
     let mut total = 0i64;
     let mut shards = 0i64;
     for n in &names {
@@ -2411,6 +2748,7 @@ pub fn handle_bulk(store: &mut Store, req: &Req, name: &str) -> Response {
             let mut version = old_ver;
             if deleted {
                 idx.docs.remove(&doc_id);
+                idx.raw_sources.remove(&doc_id);
                 crate::fields::remove_doc_values(idx, &doc_id);
                 seq = idx.index_total;
                 version = old_ver + 1;
@@ -2433,6 +2771,7 @@ pub fn handle_bulk(store: &mut Store, req: &Req, name: &str) -> Response {
                 idx.seq_nos.insert(doc_id.clone(), seq);
                 idx.index_total += 1;
                 idx.docs.insert(doc_id.clone(), Value::Object(new_doc.clone()));
+                idx.raw_sources.insert(doc_id.clone(), serde_json::to_vec(&Value::Object(new_doc.clone())).unwrap_or_default());
                 if refresh {
                     idx.pending.remove(&doc_id);
                 } else {
@@ -2661,16 +3000,11 @@ pub fn handle_bulk(store: &mut Store, req: &Req, name: &str) -> Response {
                 .get("dynamic")
                 .and_then(|d| d.as_str())
                 .map(|s| s.to_string());
-            let dynamic_false = matches!(idx.mappings.get("dynamic"), Some(Value::Bool(false)))
-                || dynamic.as_deref() == Some("false");
             let props = crate::store::ensure_properties(&mut idx.mappings);
             if let Some(derr) = check_dynamic_strict(dynamic.clone(), props, &source) {
                 has_errors = true;
                 items.push(bulk_err_api(&op, &idx.name, &doc_id, &derr));
                 continue;
-            }
-            if !dynamic_false {
-                crate::store::merge_mapping(props, &source);
             }
             idx.ensure_field_types();
         }
@@ -2718,6 +3052,7 @@ pub fn handle_bulk(store: &mut Store, req: &Req, name: &str) -> Response {
         idx.versions.insert(doc_id.clone(), planned);
         idx.seq_nos.insert(doc_id.clone(), seq);
         idx.docs.insert(doc_id.clone(), Value::Object(source.clone()));
+        idx.raw_sources.insert(doc_id.clone(), serde_json::to_vec(&Value::Object(source.clone())).unwrap_or_default());
         idx.index_total += 1;
         let mut routing = meta
             .as_ref()
@@ -3159,20 +3494,17 @@ pub fn handle_explain(store: &mut Store, req: &Req, name: &str, id: &str) -> Res
     out.insert("_id".to_string(), json!(id));
     out.insert("matched".to_string(), json!(matched));
     let expl = if matched {
-        let desc = if field.is_empty() {
-            "match_all".to_string()
-        } else {
-            format!("weight({}:{} in {})[PerFieldSimilarity], result of:", field, term, name)
-        };
+        bm25_explanation(idx, id, &query_val, score, name)
+    } else if query_val.get("term").is_some() {
         json!({
-            "value": score,
-            "description": desc,
-            "details": [{"value": score, "description": "score(freq=1.0), computed as boost * idf * tf from:", "details": []}]
+            "value": 0.0,
+            "description": format!("query doesn't match id [{}].", id),
+            "details": []
         })
     } else {
         json!({
             "value": 0.0,
-            "description": format!("query doesn't match id [{}].", id),
+            "description": "no matching term",
             "details": []
         })
     };
@@ -3200,6 +3532,105 @@ pub fn handle_explain(store: &mut Store, req: &Req, name: &str, id: &str) -> Res
         out.insert("get".to_string(), Value::Object(g));
     }
     json_response(200, Value::Object(out))
+}
+
+pub fn bm25_explanation(
+    idx: &crate::store::Index,
+    doc_id: &str,
+    q: &Value,
+    score: f64,
+    index_name: &str,
+) -> Value {
+    let (field, term) = explain_field_term(q);
+    if field.is_empty() {
+        return json!({
+            "value": score,
+            "description": "match_all",
+            "details": []
+        });
+    }
+    let doc_tokens: Vec<String> = idx
+        .doc_values
+        .get(doc_id)
+        .and_then(|m| m.get(&field))
+        .map(|v| {
+            let mut out = Vec::new();
+            for val in crate::eval::array_values(v) {
+                if let Some(s) = crate::fields::value_scalar_string(&val) {
+                    out.extend(crate::store::analyze(&s));
+                }
+            }
+            out
+        })
+        .unwrap_or_default();
+    let dl = doc_tokens.len() as f64;
+    let freq = doc_tokens.iter().filter(|t| **t == term).count() as f64;
+    let mut n = 0usize;
+    let mut total_docs = 0usize;
+    let mut total_len = 0usize;
+    for id in &idx.order {
+        let toks: Vec<String> = idx
+            .doc_values
+            .get(id)
+            .and_then(|m| m.get(&field))
+            .map(|v| {
+                let mut out = Vec::new();
+                for val in crate::eval::array_values(v) {
+                    if let Some(s) = crate::fields::value_scalar_string(&val) {
+                        out.extend(crate::store::analyze(&s));
+                    }
+                }
+                out
+            })
+            .unwrap_or_default();
+        if toks.is_empty() {
+            continue;
+        }
+        total_docs += 1;
+        total_len += toks.len();
+        if toks.iter().any(|t| *t == term) {
+            n += 1;
+        }
+    }
+    let nf = n as f64;
+    let ntot = total_docs as f64;
+    let avgdl = if total_docs > 0 {
+        total_len as f64 / total_docs as f64
+    } else {
+        1.0
+    };
+    let idf = (1.0 + (ntot - nf + 0.5) / (nf + 0.5)).ln();
+    json!({
+        "value": score,
+        "description": format!(
+            "weight({}:{} in {})[PerFieldSimilarity], result of:",
+            field, term, index_name
+        ),
+        "details": [{
+            "value": score,
+            "description": "score(freq=1.0), computed as boost * idf * tf from:",
+            "details": [
+                {
+                    "value": idf,
+                    "description": "idf, computed as log(1 + (N - n + 0.5) / (n + 0.5)) from:",
+                    "details": [
+                        {"value": nf, "description": "n, number of documents containing term"},
+                        {"value": ntot, "description": "N, total number of documents with field"}
+                    ]
+                },
+                {
+                    "value": freq / (freq + 1.2 * (1.0 - 0.75 + 0.75 * dl / avgdl)),
+                    "description": "tf, computed as freq / (freq + k1 * (1 - b + b * dl / avgdl)) from:",
+                    "details": [
+                        {"value": 1.2, "description": "k1, term saturation parameter"},
+                        {"value": 0.75, "description": "b, length normalization parameter"},
+                        {"value": dl, "description": "dl, length of field"},
+                        {"value": avgdl, "description": "avgdl, average length of field"}
+                    ]
+                }
+            ]
+        }]
+    })
 }
 
 fn explain_field_term(q: &Value) -> (String, String) {
@@ -3465,6 +3896,10 @@ pub fn handle_update_by_query(store: &mut Store, req: &Req, name: &str) -> Respo
         _ => None,
     };
     let params = script_obj.map(crate::painless::script_params_of).unwrap_or_default();
+    let pipeline_name = match crate::ingest::effective_ingest_pipeline(store, &target, req.param("pipeline").unwrap_or("")) {
+        Ok(p) => p,
+        Err(e) => return err_response(e),
+    };
     if let Some(src) = &script_src {
         let idx = &store.indices[&target];
         let mut sc = Map::new();
@@ -3517,6 +3952,32 @@ pub fn handle_update_by_query(store: &mut Store, req: &Req, name: &str) -> Respo
             continue;
         }
         let mut newdoc = cur;
+        let mut pipeline_applied = false;
+        if let Some(pname) = &pipeline_name {
+            let mut meta = Map::new();
+            meta.insert("_index".to_string(), json!(target));
+            meta.insert("_id".to_string(), json!(id));
+            match crate::ingest::run_ingest_pipeline(store, pname, newdoc.clone(), meta) {
+                Ok(out) => {
+                    if out.dropped {
+                        let idx = store.indices.get_mut(&target).unwrap();
+                        idx.docs.remove(id);
+                        idx.raw_sources.remove(id);
+                        crate::fields::remove_doc_values(idx, id);
+                        deleted += 1;
+                        continue;
+                    }
+                    newdoc = out.source;
+                    pipeline_applied = true;
+                }
+                Err(e) => {
+                    failure_status = e.status;
+                    failures.push(json!({"id": id, "index": target,
+                        "cause": {"type": e.typ, "reason": e.reason}}));
+                    continue;
+                }
+            }
+        }
         let idx = store.indices.get_mut(&target).unwrap();
         if let Err(e) = crate::fields::compute_doc_values(idx, id, &mut newdoc) {
             failure_status = e.status;
@@ -3524,7 +3985,8 @@ pub fn handle_update_by_query(store: &mut Store, req: &Req, name: &str) -> Respo
                 "cause": {"type": e.typ, "reason": e.reason}}));
             continue;
         }
-        let changed = script_src.is_some() && Value::Object(newdoc.clone()) != Value::Object(old);
+        let changed = pipeline_applied
+            || (script_src.is_some() && Value::Object(newdoc.clone()) != Value::Object(old));
         if script_src.is_some() && !changed {
             noops += 1;
             continue;
@@ -3533,7 +3995,8 @@ pub fn handle_update_by_query(store: &mut Store, req: &Req, name: &str) -> Respo
         idx.versions.insert(id.clone(), old_ver + 1);
         idx.seq_nos.insert(id.clone(), seq);
         idx.index_total += 1;
-        idx.docs.insert(id.clone(), Value::Object(newdoc));
+        idx.docs.insert(id.clone(), Value::Object(newdoc.clone()));
+        idx.raw_sources.insert(id.clone(), serde_json::to_vec(&Value::Object(newdoc)).unwrap_or_default());
         updated += 1;
     }
     if req.bool_param("refresh") {
