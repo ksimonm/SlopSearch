@@ -81,8 +81,9 @@ run sequentially. Failures are reported one line each; add `TB=long` for full
 tracebacks when debugging a few tests (`make go-test TB=long ARGS="-k terms_order"`). Reports from `*-score` are
 kept in `.score/<server>/`.
 
-The loop: pick a red area, read what the tests expect (and what the reference answers —
-`make ref-up`, then `curl localhost:9290/...`), make it green, check nothing else broke.
+The loop: pick a red area, read what the tests expect and what the real OpenSearch
+answered (`make ref-show T=<test name>`), make it green, check nothing else broke.
+You don't need to run OpenSearch for this — see [Reference answers](#reference-answers).
 
 ## The test suite
 
@@ -113,23 +114,44 @@ Opt-in suites that need more than one server process:
 
 ### Adding a test
 
-A test may only encode what real OpenSearch does. Write it, then prove it against the
-reference before committing:
+A test may only encode what real OpenSearch does. Write it, prove it against the
+reference, and re-record the reference answers of that file:
 
 ```bash
 make ref-test ARGS=tests/test_41_aggs_bucket.py
+make ref-record ARGS=tests/test_41_aggs_bucket.py
 ```
+
+This is the one task that needs the reference OpenSearch running (Docker, ~2 GB RAM).
 
 Use unique index names (the `index_factory` fixture does this), clean up anything
 cluster-wide you create, and don't depend on timing or test order.
+
+## Reference answers
+
+Every HTTP exchange the suite has with the real OpenSearch 3.9.0 is recorded in
+`tests/reference/<test file>.jsonl`: request, body, status code and response, per test.
+Working on a server never needs a running OpenSearch:
+
+```bash
+make ref-show T=terms_order                          # tests whose name contains the text
+make ref-show T=test_41_aggs_bucket.py::test_terms_order_by_count
+make go-test TB=short ARGS="-k terms_order"          # failures print the reference exchange
+```
+
+The files are plain JSON lines, so `grep` works on them too. Index names carry random
+suffixes and differ from your run; long bodies are cut at 8000 characters.
+
+When tests change, the recording is refreshed against the real OpenSearch with
+`make ref-record` (all files, about a minute) or `make ref-record ARGS=tests/<file>.py`.
 
 ## Reference OpenSearch
 
 `compose.yaml` runs the official `opensearchproject/opensearch:3.9.0` image — the full
 distribution with all bundled plugins — with the security plugin disabled, because the
-suite talks plain HTTP, and its data kept in RAM. Its plugins make every index
-create/delete cost ~0.2 s, so the full suite takes ~5 minutes against it (4 workers) —
-more workers overload its cluster manager and requests start timing out.
+suite talks plain HTTP, and its data kept in RAM (~1.5 GB image, ~2 GB RAM). You need it
+only to add or change tests, or to try requests no test makes. More than 4 test workers
+overload its cluster manager and requests start timing out.
 
 ## Layout
 
@@ -140,7 +162,9 @@ servers/go/            Go implementation
 servers/rust/          Rust implementation
 servers/*.sh           helpers: restart a server, run a local multi-node topology
 tests/                 the compatibility suite (pytest + httpx)
+tests/reference/       recorded answers of the real OpenSearch, per test
 scripts/score.py       pass rate per test file
+scripts/ref.py         show and re-record the reference answers
 docs/logo/             logo and icon (SVG)
 ```
 

@@ -7,6 +7,9 @@
 #
 # usage: opensearch-cluster.sh <up|down|status|env|stop-node N|kill-node N|start-node N>
 #   N is a node name (a1..a4, b1).
+# OS_HOME is an unpacked OpenSearch 3.9.0 distribution (needs no system Java), e.g.
+#   curl -LO https://artifacts.opensearch.org/releases/bundle/opensearch/3.9.0/opensearch-3.9.0-linux-x64.tar.gz
+#   mkdir -p /tmp/os-3.9 && tar xzf opensearch-3.9.0-linux-x64.tar.gz -C /tmp/os-3.9 --strip-components=1
 # env: OS_HOME (default /tmp/os-3.9), SS_CLUSTER_ID (0..3, shifts all ports by
 #      100*ID so several topologies can coexist), SS_CLUSTER_DIR, SS_HEAP.
 set -euo pipefail

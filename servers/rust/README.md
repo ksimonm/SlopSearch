@@ -20,8 +20,10 @@ make rust-dev                                       # serves :9292
 OS_PORT=9292 .venv/bin/pytest -m aggs
 ```
 
-To see what OpenSearch really answers for a request, run it against the reference:
-`make ref-up`, then `curl localhost:9290/...`.
+To see what OpenSearch really answers in a test, without running OpenSearch:
+`make ref-show T=<part of the test name>` (or add `TB=short` to a test run: a failing
+test then prints the reference exchange). For requests no test makes, start the
+reference with `make ref-up` and `curl localhost:9290/...`.
 
 ## Layout
 

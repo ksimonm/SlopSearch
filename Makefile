@@ -13,11 +13,13 @@ JOBS ?= 4
 # dominates runs with thousands of failures; use TB=long when debugging a few tests.
 TB ?= line
 COMPOSE := docker compose
-RUN_TESTS := $(COMPOSE) run --rm --build tests
+# run as the host user so reports and recordings in the working tree are not owned by root
+RUN_TESTS := $(COMPOSE) run --rm --build --user "$(shell id -u):$(shell id -g)" tests
 PYTEST := pytest -n $(JOBS) --dist loadfile --tb=$(TB)
 
 .DEFAULT_GOAL := help
 .PHONY: help go-up rust-up ref-up go-test rust-test ref-test go-score rust-score ref-score \
+        ref-show ref-record \
         go-dev rust-dev test go-logs rust-logs down
 
 help: ## list targets
@@ -46,6 +48,12 @@ go-score: go-up ## pass rate per test file for the Go server
 
 rust-score: rust-up ## pass rate per test file for the Rust server
 	$(RUN_TESTS) env OS_HOST=rust python scripts/score.py --jobs $(JOBS) --label rust $(ARGS)
+
+ref-show: ## what the reference OpenSearch answered in a test, no OpenSearch needed: make ref-show T=<name part>
+	@$(RUN_TESTS) python scripts/ref.py show "$(T)"
+
+ref-record: ref-up ## re-record tests/reference after changing tests (ARGS=test files, default all)
+	$(RUN_TESTS) env OS_HOST=opensearch python scripts/ref.py record --jobs $(JOBS) $(ARGS)
 
 ref-score: ref-up ## pass rate per test file for reference OpenSearch (should be 100%)
 	$(RUN_TESTS) env OS_HOST=opensearch python scripts/score.py --jobs $(JOBS) --label opensearch $(ARGS)

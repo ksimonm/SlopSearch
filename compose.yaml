@@ -58,5 +58,6 @@ services:
     working_dir: /work
     environment:
       OS_PORT: "9200"
+      HOME: /tmp
     extra_hosts:
       - "host.docker.internal:host-gateway"
