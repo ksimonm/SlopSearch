@@ -11,10 +11,10 @@ import (
 
 const (
 	nodeHost       = "127.0.0.1"
-	nodeEphemeral  = "slopsearch-ephemeral-id"
+	nodeEphemeral  = "slopensearch-ephemeral-id"
 	nodeTransport  = "127.0.0.1:9300"
 	luceneVersion  = "10.5.1"
-	stateUUIDConst = "slopsearch-state-uuid"
+	stateUUIDConst = "slopensearch-state-uuid"
 )
 
 func nowMillis() int64 { return time.Now().UnixMilli() }

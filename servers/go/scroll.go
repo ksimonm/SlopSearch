@@ -20,7 +20,7 @@ func (s *Server) newScrollID() string {
 	s.scrollMu.Lock()
 	defer s.scrollMu.Unlock()
 	s.scrollCounter++
-	return fmt.Sprintf("slopsearch-scroll-%d", s.scrollCounter)
+	return fmt.Sprintf("slopensearch-scroll-%d", s.scrollCounter)
 }
 
 func (s *Server) storeScroll(hits []multiHit, pos, size, total int, restInt bool) string {
@@ -137,7 +137,7 @@ func (s *Server) handleScroll(w http.ResponseWriter, r *http.Request, rest []str
 			Reason: "Validation Failed: 1: scrollId is missing;"})
 		return
 	}
-	if !strings.HasPrefix(sid, "slopsearch-scroll-") {
+	if !strings.HasPrefix(sid, "slopensearch-scroll-") {
 		writeError(w, &apiError{Type: "illegal_argument_exception", Status: 400, Reason: "Cannot parse scroll id"})
 		return
 	}
@@ -230,7 +230,7 @@ func (s *Server) clearScroll(w http.ResponseWriter, r *http.Request, rest []stri
 		return
 	}
 	for _, id := range ids {
-		if !strings.HasPrefix(id, "slopsearch-scroll-") {
+		if !strings.HasPrefix(id, "slopensearch-scroll-") {
 			writeError(w, &apiError{Type: "illegal_argument_exception", Status: 400, Reason: "Cannot parse scroll id"})
 			return
 		}

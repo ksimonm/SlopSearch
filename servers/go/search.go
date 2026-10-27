@@ -379,7 +379,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request, name strin
 				Reason: "Validation Failed: 1: [indices] cannot be used with point in time;"})
 			return
 		}
-		if !strings.HasPrefix(pitID, "slopsearch-pit-") {
+		if !strings.HasPrefix(pitID, "slopensearch-pit-") {
 			writeError(w, &apiError{Type: "illegal_argument_exception", Status: 400, Reason: "invalid id: [" + pitID + "]"})
 			return
 		}
@@ -1208,7 +1208,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request, name strin
 		}
 		if explainFlag {
 			entry["_shard"] = "[" + h.idx.Name + "][0]"
-			entry["_node"] = "slopsearch-node-1"
+			entry["_node"] = "slopensearch-node-1"
 			field, term := explainLabel(query)
 			qc := newQueryCtxForDoc(h.idx, h.id, h.doc)
 			exp := qc.bm25Explain(field, term, h.score)

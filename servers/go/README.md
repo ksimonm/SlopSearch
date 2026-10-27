@@ -1,4 +1,4 @@
-# SlopSearch — Go implementation
+# SlopenSearch — Go implementation
 
 Standard library only (`net/http`, `encoding/json`), no third-party modules.
 Everything is in `package main`; the server keeps all data in memory.

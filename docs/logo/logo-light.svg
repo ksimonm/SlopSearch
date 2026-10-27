@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 128" width="500" height="128" role="img" aria-label="SlopSearch">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 590 128" width="590" height="128" role="img" aria-label="SlopenSearch">
   <defs>
     <clipPath id="lens"><circle cx="54" cy="54" r="34"/></clipPath>
     <linearGradient id="slop" x1="0" y1="0" x2="0" y2="1">
@@ -25,5 +25,5 @@
   <!-- drip -->
   <path d="M38 88 C 38 96, 30 104, 30 110 a 8 8 0 0 0 16 0 C 46 104, 38 96, 38 88 Z" fill="url(#slop)" stroke="#0E2A3F" stroke-width="3"/>
   </g>
-  <text x="136" y="86" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="66" font-weight="800" letter-spacing="-1.5"><tspan fill="#16A35A">Slop</tspan><tspan fill="#0E2A3F">Search</tspan></text>
+  <text x="136" y="86" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="66" font-weight="800" letter-spacing="-1.5"><tspan fill="#16A35A">Slopen</tspan><tspan fill="#0E2A3F">Search</tspan></text>
 </svg>

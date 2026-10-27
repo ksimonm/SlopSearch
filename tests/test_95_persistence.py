@@ -22,7 +22,7 @@ pytestmark = [
     pytest.mark.skipif(not RESTART_CMD, reason="OS_RESTART_CMD is not set"),
 ]
 
-PFX = f"slopsearch-persist-{uuid.uuid4().hex[:8]}"
+PFX = f"slopensearch-persist-{uuid.uuid4().hex[:8]}"
 MAIN = f"{PFX}-main"
 CLOSED = f"{PFX}-closed"
 TEMPLATE = f"{PFX}-tpl"

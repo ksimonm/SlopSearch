@@ -1,4 +1,4 @@
-# SlopSearch — Rust implementation
+# SlopenSearch — Rust implementation
 
 `axum` + `tokio` + `serde_json` (plus `regex` and `base64`); the server keeps all data
 in memory behind one `Arc<Mutex<Store>>`. Much of the query and aggregation code is a port

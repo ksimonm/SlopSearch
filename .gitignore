@@ -8,7 +8,7 @@ __pycache__/
 
 # Server build artifacts
 servers/rust/target/
-servers/go/slopsearch
+servers/go/slopensearch
 
 
 # Compatibility score reports (scripts/score.py)

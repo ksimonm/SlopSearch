@@ -47,7 +47,7 @@ def index_factory(client):
     created = []
 
     def _create(name=None, body=None, mappings=None, settings=None):
-        name = name or f"slopsearch-test-{uuid.uuid4().hex[:8]}"
+        name = name or f"slopensearch-test-{uuid.uuid4().hex[:8]}"
         payload = dict(body or {})
         if mappings is not None:
             payload["mappings"] = mappings

@@ -22,7 +22,7 @@ pytestmark = pytest.mark.fulltext
 
 
 def _create(client, mappings, docs, settings=None):
-    name = f"slopsearch-ft31-{uuid.uuid4().hex[:10]}"
+    name = f"slopensearch-ft31-{uuid.uuid4().hex[:10]}"
     s = {"number_of_shards": 1, "number_of_replicas": 0}
     if settings:
         s.update(settings)

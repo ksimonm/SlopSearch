@@ -68,7 +68,7 @@ MONTH_COUNTS = [2, 0, 1, 3, 1, 1]
 
 
 def _make_index(client, mapping, docs):
-    name = f"slopsearch-test-aggm-{uuid.uuid4().hex[:10]}"
+    name = f"slopensearch-test-aggm-{uuid.uuid4().hex[:10]}"
     r = client.put(f"/{name}", json={"settings": SETTINGS, "mappings": mapping})
     assert r.status_code in (200, 201), r.text
     lines = []

@@ -57,7 +57,7 @@ func (s *Server) openPit(w http.ResponseWriter, r *http.Request, name string) {
 
 	s.pitMu.Lock()
 	s.pitCounter++
-	pid := fmt.Sprintf("slopsearch-pit-%d", s.pitCounter)
+	pid := fmt.Sprintf("slopensearch-pit-%d", s.pitCounter)
 	s.pits[pid] = &pitContext{idx: idx, hits: hits, shards: shards,
 		keepAlive: int64(d / time.Millisecond), creation: creation, indexName: name}
 	s.pitMu.Unlock()
@@ -113,7 +113,7 @@ func (s *Server) handlePitRoute(w http.ResponseWriter, r *http.Request, rest []s
 			return
 		}
 		for _, id := range ids {
-			if !strings.HasPrefix(id, "slopsearch-pit-") {
+			if !strings.HasPrefix(id, "slopensearch-pit-") {
 				writeError(w, &apiError{Type: "illegal_argument_exception", Status: 400, Reason: "invalid id: [" + id + "]"})
 				return
 			}

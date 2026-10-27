@@ -1,4 +1,4 @@
-# SlopSearch developer entry point. Only Docker is required; `make help` lists targets.
+# SlopenSearch developer entry point. Only Docker is required; `make help` lists targets.
 #
 #   make go-test                       # build + start the Go server, run the whole suite
 #   make rust-test ARGS="-m aggs"      # Rust server, one area (pytest marker)

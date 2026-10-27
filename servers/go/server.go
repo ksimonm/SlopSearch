@@ -1807,7 +1807,7 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
-	fmt.Println("slopsearch (go) listening on " + addr)
+	fmt.Println("slopensearch (go) listening on " + addr)
 	if err := srv.ListenAndServe(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

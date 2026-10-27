@@ -95,7 +95,7 @@ def _bulk(client, index, docs, ids=True, routing=None):
     assert r.json()["errors"] is False, r.text
 
 
-def _make_index(client, mappings, docs, prefix="slopsearch-aggb"):
+def _make_index(client, mappings, docs, prefix="slopensearch-aggb"):
     name = f"{prefix}-{uuid.uuid4().hex[:10]}"
     r = client.put(f"/{name}", json={"settings": SETTINGS, "mappings": mappings})
     assert r.status_code == 200, r.text

@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="SlopSearch">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="SlopenSearch">
   <defs>
     <clipPath id="lens"><circle cx="54" cy="54" r="34"/></clipPath>
     <linearGradient id="slop" x1="0" y1="0" x2="0" y2="1">

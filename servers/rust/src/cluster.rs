@@ -10,9 +10,9 @@ use crate::{Req, Store};
 use axum::response::Response;
 
 pub(crate) const NODE_HOST: &str = "127.0.0.1";
-const NODE_EPHEMERAL: &str = "slopsearch-ephemeral-id";
+const NODE_EPHEMERAL: &str = "slopensearch-ephemeral-id";
 const NODE_TRANSPORT: &str = "127.0.0.1:9300";
-const STATE_UUID: &str = "slopsearch-state-uuid";
+const STATE_UUID: &str = "slopensearch-state-uuid";
 
 pub(crate) fn node_roles() -> Value {
     json!(["cluster_manager", "data", "ingest", "remote_cluster_client"])

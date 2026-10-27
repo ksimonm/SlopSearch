@@ -4874,7 +4874,7 @@ pub fn handle_search_shards(store: &mut Store, req: &Req, name: &str) -> Respons
         }
     }
     let nodes = json!({crate::store::NODE_ID: {
-        "name": "slopsearch",
+        "name": "slopensearch",
         "transport_address": "127.0.0.1:9300",
         "host": "127.0.0.1",
         "ip": "127.0.0.1",

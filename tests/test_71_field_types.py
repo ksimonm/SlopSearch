@@ -79,7 +79,7 @@ def try_create(client):
     names = []
 
     def _create(mappings=None, settings=None):
-        name = f"slopsearch-t71-{uuid.uuid4().hex[:10]}"
+        name = f"slopensearch-t71-{uuid.uuid4().hex[:10]}"
         names.append(name)
         body = {"settings": dict(SETTINGS, **(settings or {}))}
         if mappings is not None:

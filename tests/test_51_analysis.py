@@ -71,7 +71,7 @@ def _ids(client, index, query):
 
 
 def _unique(prefix="a51"):
-    return f"slopsearch-test-{prefix}-{uuid.uuid4().hex[:8]}"
+    return f"slopensearch-test-{prefix}-{uuid.uuid4().hex[:8]}"
 
 
 # --------------------------------------------------------------------------

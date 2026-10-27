@@ -1,12 +1,12 @@
-# SlopSearch dev stack. Usually driven through the Makefile (`make help`).
+# SlopenSearch dev stack. Usually driven through the Makefile (`make help`).
 #
 #   opensearch  reference OpenSearch 3.9.0 (full distribution, security off)  :9290
-#   go          SlopSearch, Go implementation                                  :9291
-#   rust        SlopSearch, Rust implementation                                :9292
+#   go          SlopenSearch, Go implementation                                  :9291
+#   rust        SlopenSearch, Rust implementation                                :9292
 #   tests       the compatibility suite (pytest), run on demand
 #
 # Host ports can be changed in .env (OPENSEARCH_PORT, GO_PORT, RUST_PORT).
-name: slopsearch
+name: slopensearch
 
 services:
   opensearch:

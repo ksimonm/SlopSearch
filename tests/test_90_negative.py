@@ -5,7 +5,7 @@ MAPPING = {"properties": {"title": {"type": "text"}, "price": {"type": "integer"
 
 @pytest.mark.smoke
 def test_search_missing_index_returns_404(client):
-    r = client.post("/slopsearch-no-such-index/_search", json={"query": {"match_all": {}}})
+    r = client.post("/slopensearch-no-such-index/_search", json={"query": {"match_all": {}}})
     assert r.status_code == 404
     assert r.json()["error"]["type"] == "index_not_found_exception"
 
@@ -34,7 +34,7 @@ def test_wrong_field_type_in_range_returns_400(client, index_factory):
 
 def test_invalid_mapping_returns_400(client):
     r = client.put(
-        "/slopsearch-bad-mapping",
+        "/slopensearch-bad-mapping",
         json={"mappings": {"properties": {"x": {"type": "nonexistent_type"}}}},
     )
     assert r.status_code == 400
@@ -48,5 +48,5 @@ def test_get_missing_document_returns_404(client, index_factory):
 
 
 def test_delete_missing_index_returns_404(client):
-    r = client.delete("/slopsearch-no-such-index-delete")
+    r = client.delete("/slopensearch-no-such-index-delete")
     assert r.status_code == 404

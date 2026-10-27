@@ -1,6 +1,6 @@
-# Contributing to SlopSearch
+# Contributing to SlopenSearch
 
-Thanks for helping. SlopSearch has one rule that everything else follows from:
+Thanks for helping. SlopenSearch has one rule that everything else follows from:
 **the test suite is the specification.** Each test encodes what a real OpenSearch 3.9.0
 does, and a server is correct exactly when the tests pass.
 
@@ -47,7 +47,7 @@ CI runs every change to `tests/` against the reference OpenSearch.
 
 ## Reporting a compatibility gap
 
-Open an issue with the request, what OpenSearch 3.9.0 answers, and what SlopSearch
+Open an issue with the request, what OpenSearch 3.9.0 answers, and what SlopenSearch
 answers. A failing test in a pull request is even better.
 
 ## Pull requests

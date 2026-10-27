@@ -1,3 +1,3 @@
-module slopsearch
+module slopensearch
 
 go 1.25

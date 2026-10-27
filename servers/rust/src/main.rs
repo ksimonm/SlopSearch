@@ -753,13 +753,13 @@ async fn main() {
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("slopsearch (rust): cannot listen on {}: {}", addr, e);
+            eprintln!("slopensearch (rust): cannot listen on {}: {}", addr, e);
             std::process::exit(1);
         }
     };
-    println!("slopsearch (rust) listening on {}", addr);
+    println!("slopensearch (rust) listening on {}", addr);
     if let Err(e) = axum::serve(listener, app).await {
-        eprintln!("slopsearch (rust): {}", e);
+        eprintln!("slopensearch (rust): {}", e);
         std::process::exit(1);
     }
 }

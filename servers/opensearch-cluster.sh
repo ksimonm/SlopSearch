@@ -13,7 +13,7 @@ set -euo pipefail
 
 OS_HOME="${OS_HOME:-/tmp/os-3.9}"
 ID="${SS_CLUSTER_ID:-0}"
-DIR="${SS_CLUSTER_DIR:-/tmp/slopsearch-cluster-$ID}"
+DIR="${SS_CLUSTER_DIR:-/tmp/slopensearch-cluster-$ID}"
 HEAP="${SS_HEAP:-512m}"
 (( ID >= 0 && ID <= 3 )) || { echo "SS_CLUSTER_ID must be 0..3" >&2; exit 1; }
 OFF=$((ID * 100))

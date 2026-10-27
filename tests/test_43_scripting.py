@@ -150,7 +150,7 @@ DOCS = [
 
 @pytest.fixture(scope="module")
 def sidx(client):
-    name = f"slopsearch-scripting-{_uid()}"
+    name = f"slopensearch-scripting-{_uid()}"
     r = client.put(
         f"/{name}",
         json={
@@ -197,7 +197,7 @@ def stored_script(client):
     created = []
 
     def _put(body, context=None, sid=None):
-        sid = sid or f"slopsearch-script-{_uid()}"
+        sid = sid or f"slopensearch-script-{_uid()}"
         path = f"/_scripts/{sid}" + (f"/{context}" if context else "")
         r = client.put(path, json=body)
         created.append(sid)
@@ -213,7 +213,7 @@ def plain_index(client):
     created = []
 
     def _create(docs=None, mappings=None):
-        name = f"slopsearch-scripting-{_uid()}"
+        name = f"slopensearch-scripting-{_uid()}"
         body = {"settings": {"number_of_shards": 1, "number_of_replicas": 0}}
         if mappings:
             body["mappings"] = mappings
@@ -1045,7 +1045,7 @@ def test_execute_context_setup_missing_index(client):
         client,
         "true",
         context="filter",
-        setup={"index": f"slopsearch-nope-{_uid()}", "document": {}},
+        setup={"index": f"slopensearch-nope-{_uid()}", "document": {}},
     )
     assert r.status_code == 404
     assert r.json()["error"]["type"] == "index_not_found_exception"
@@ -1077,7 +1077,7 @@ CTX_DOC = {
 
 @pytest.fixture(scope="module")
 def ctx_index(client):
-    name = f"slopsearch-scripting-ctx-{_uid()}"
+    name = f"slopensearch-scripting-ctx-{_uid()}"
     r = client.put(
         f"/{name}",
         json={
@@ -2860,7 +2860,7 @@ def test_ubq_script_compile_error(client, qidx):
 
 
 def _reindex(client, plain_index, src, script):
-    dest = f"slopsearch-scripting-{_uid()}"
+    dest = f"slopensearch-scripting-{_uid()}"
     plain_index.track(dest)
     r = client.post(
         "/_reindex",
@@ -2917,7 +2917,7 @@ def test_reindex_script_remove_field_and_read_index(client, plain_index, qidx):
 
 
 def test_reindex_script_routes_to_other_index(client, plain_index, qidx):
-    other = f"slopsearch-scripting-{_uid()}"
+    other = f"slopensearch-scripting-{_uid()}"
     plain_index.track(other)
     dest, r = _reindex(
         client,
@@ -3043,7 +3043,7 @@ def test_ingest_script_compile_error_on_simulate(client):
 
 
 def test_ingest_script_compile_error_on_put_pipeline(client):
-    pid = f"slopsearch-pipe-{_uid()}"
+    pid = f"slopensearch-pipe-{_uid()}"
     r = client.put(f"/_ingest/pipeline/{pid}", json={"processors": [{"script": {"source": "ctx.x = 1 +"}}]})
     try:
         assert r.status_code == 400
@@ -3055,7 +3055,7 @@ def test_ingest_script_compile_error_on_put_pipeline(client):
 
 
 def test_ingest_script_missing_stored_script(client):
-    sid = f"slopsearch-nope-{_uid()}"
+    sid = f"slopensearch-nope-{_uid()}"
     r = _simulate(client, [{"script": {"id": sid}}], [{"a": 1}])
     assert r.status_code == 404
     err = r.json()["error"]
@@ -3079,7 +3079,7 @@ def test_ingest_script_empty_on_failure_rejected(client):
 
 
 def test_ingest_pipeline_script_applied_on_index(client, plain_index):
-    pid = f"slopsearch-pipe-{_uid()}"
+    pid = f"slopensearch-pipe-{_uid()}"
     r = client.put(
         f"/_ingest/pipeline/{pid}",
         json={"processors": [{"script": {"source": "ctx.total = ctx.price * ctx.qty"}}]},
@@ -3123,7 +3123,7 @@ def test_stored_script_put_get_delete(client, stored_script):
 
 
 def test_stored_script_delete_missing(client):
-    sid = f"slopsearch-nope-{_uid()}"
+    sid = f"slopensearch-nope-{_uid()}"
     r = client.delete(f"/_scripts/{sid}")
     assert r.status_code == 404
     err = r.json()["error"]
@@ -3179,7 +3179,7 @@ def test_stored_expression_script(client, sidx, stored_script):
 
 
 def test_stored_script_missing_in_search(client, sidx):
-    sid = f"slopsearch-nope-{_uid()}"
+    sid = f"slopensearch-nope-{_uid()}"
     r = search(client, sidx, {"script_fields": {"x": {"script": {"id": sid}}}})
     assert r.status_code == 404
     body = r.json()
@@ -3192,7 +3192,7 @@ def test_stored_script_missing_in_search(client, sidx):
 
 
 def test_stored_script_missing_in_update(client, udoc):
-    sid = f"slopsearch-nope-{_uid()}"
+    sid = f"slopensearch-nope-{_uid()}"
     r = _update(client, udoc, {"script": {"id": sid}})
     assert r.status_code == 400
     err = r.json()["error"]
@@ -3505,7 +3505,7 @@ def test_render_stored_template_by_path_and_body(client, stored_script):
 
 
 def test_render_missing_stored_template(client):
-    sid = f"slopsearch-nope-{_uid()}"
+    sid = f"slopensearch-nope-{_uid()}"
     r = client.post(f"/_render/template/{sid}", json={"params": {}})
     assert r.status_code == 404
     assert r.json()["error"] == {
@@ -3632,7 +3632,7 @@ def test_search_template_source_wins_over_id(client, sidx, stored_script):
 
 
 def test_search_template_missing_stored(client, sidx):
-    sid = f"slopsearch-nope-{_uid()}"
+    sid = f"slopensearch-nope-{_uid()}"
     r = _st(client, sidx, {"id": sid, "params": {}})
     assert r.status_code == 404
     assert r.json()["error"]["type"] == "resource_not_found_exception"
@@ -3670,7 +3670,7 @@ def test_search_template_explain(client, sidx):
 
 
 def test_msearch_template(client, sidx):
-    sid = f"slopsearch-nope-{_uid()}"
+    sid = f"slopensearch-nope-{_uid()}"
     payload = _ndjson(
         [
             {"index": sidx},

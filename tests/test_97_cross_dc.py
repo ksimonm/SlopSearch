@@ -48,7 +48,7 @@ needs_remote_ctl = pytest.mark.skipif(
     reason="OS_CLUSTER_URLS, OS_REMOTE_URL and OS_CLUSTER_CTL are required",
 )
 
-PFX = f"slopsearch-xdc-{uuid.uuid4().hex[:8]}"
+PFX = f"slopensearch-xdc-{uuid.uuid4().hex[:8]}"
 ATTR = "zone"
 WEIGHTS = f"/_cluster/routing/awareness/{ATTR}/weights"
 DECOM = "/_cluster/decommission/awareness"

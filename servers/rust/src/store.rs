@@ -6,9 +6,9 @@ use crate::resp::format_number;
 
 pub const VERSION_CREATED: &str = "137307827";
 pub const CLUSTER_NAME: &str = "opensearch";
-pub const CLUSTER_UUID: &str = "slopsearch-cluster-uuid";
-pub const NODE_ID: &str = "slopsearch-node-id";
-pub const NODE_NAME: &str = "slopsearch-node";
+pub const CLUSTER_UUID: &str = "slopensearch-cluster-uuid";
+pub const NODE_ID: &str = "slopensearch-node-id";
+pub const NODE_NAME: &str = "slopensearch-node";
 pub const NODE_VERSION: &str = "3.9.0";
 pub const LUCENE_VERSION: &str = "10.5.1";
 

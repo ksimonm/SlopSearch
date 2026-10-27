@@ -22,7 +22,7 @@ MAPPING = {
 # --------------------------------------------------------------------------- helpers
 
 
-def _uniq(prefix="slopsearch-doc"):
+def _uniq(prefix="slopensearch-doc"):
     return f"{prefix}-{uuid.uuid4().hex[:10]}"
 
 
@@ -354,7 +354,7 @@ def test_numeric_looking_ids_are_strings(client, idx):
 
 
 def test_index_auto_creates_index_with_dynamic_mapping(client, scratch_names):
-    name = _uniq("slopsearch-auto")
+    name = _uniq("slopensearch-auto")
     scratch_names.append(name)
     r = _put(client, name, "1", {"s": "x", "n": 1, "f": 1.5, "b": True, "d": "2020-01-01", "o": {"k": 1}})
     assert r.status_code == 201
@@ -369,7 +369,7 @@ def test_index_auto_creates_index_with_dynamic_mapping(client, scratch_names):
 
 
 def test_auto_created_index_default_settings(client, scratch_names):
-    name = _uniq("slopsearch-auto")
+    name = _uniq("slopensearch-auto")
     scratch_names.append(name)
     _put(client, name, "1", {"a": 1})
     s = client.get(f"/{name}/_settings").json()[name]["settings"]["index"]
@@ -379,7 +379,7 @@ def test_auto_created_index_default_settings(client, scratch_names):
 
 
 def test_post_autogen_auto_creates_index(client, scratch_names):
-    name = _uniq("slopsearch-auto")
+    name = _uniq("slopensearch-auto")
     scratch_names.append(name)
     r = client.post(f"/{name}/_doc", json={"a": 1})
     assert r.status_code == 201
@@ -387,14 +387,14 @@ def test_post_autogen_auto_creates_index(client, scratch_names):
 
 
 def test_create_endpoint_auto_creates_index(client, scratch_names):
-    name = _uniq("slopsearch-auto")
+    name = _uniq("slopensearch-auto")
     scratch_names.append(name)
     r = client.put(f"/{name}/_create/1", json={"a": 1})
     assert r.status_code == 201
 
 
 def test_bulk_auto_creates_index(client, scratch_names):
-    name = _uniq("slopsearch-auto")
+    name = _uniq("slopensearch-auto")
     scratch_names.append(name)
     r = _bulk(client, [{"index": {"_index": name, "_id": "1"}}, {"a": 1}])
     assert r.status_code == 200
@@ -403,7 +403,7 @@ def test_bulk_auto_creates_index(client, scratch_names):
 
 
 def test_update_on_missing_index_auto_creates_it(client, scratch_names):
-    name = _uniq("slopsearch-auto")
+    name = _uniq("slopensearch-auto")
     scratch_names.append(name)
     r = client.post(f"/{name}/_update/1", json={"doc": {"a": 1}})
     assert r.status_code == 404
@@ -413,7 +413,7 @@ def test_update_on_missing_index_auto_creates_it(client, scratch_names):
 
 
 def test_update_upsert_on_missing_index_creates_index_and_doc(client, scratch_names):
-    name = _uniq("slopsearch-auto")
+    name = _uniq("slopensearch-auto")
     scratch_names.append(name)
     r = client.post(f"/{name}/_update/1", json={"doc": {"a": 1}, "doc_as_upsert": True})
     assert r.status_code == 201
@@ -421,7 +421,7 @@ def test_update_upsert_on_missing_index_creates_index_and_doc(client, scratch_na
 
 
 def test_delete_doc_on_missing_index_is_404_and_does_not_create(client):
-    name = _uniq("slopsearch-auto")
+    name = _uniq("slopensearch-auto")
     r = client.delete(f"/{name}/_doc/1")
     assert r.status_code == 404
     assert _err_type(r) == "index_not_found_exception"
@@ -455,7 +455,7 @@ def test_get_missing_doc_shape(client, idx):
 
 
 def test_get_missing_index(client):
-    name = _uniq("slopsearch-missing")
+    name = _uniq("slopensearch-missing")
     r = _get(client, name, "1")
     assert r.status_code == 404
     err = r.json()["error"]
@@ -471,7 +471,7 @@ def test_head_doc(client, idx):
     assert r.status_code == 200
     assert r.content == b""
     assert client.head(f"/{idx}/_doc/2").status_code == 404
-    assert client.head(f"/{_uniq('slopsearch-missing')}/_doc/1").status_code == 404
+    assert client.head(f"/{_uniq('slopensearch-missing')}/_doc/1").status_code == 404
 
 
 def test_head_source(client, idx):
@@ -802,7 +802,7 @@ def test_routing_search_filter(client, index_factory):
 def test_mget_docs_mixed_indices_and_missing(client, index_factory):
     a = index_factory(settings=SINGLE)
     b = index_factory(settings=SINGLE)
-    missing = _uniq("slopsearch-missing")
+    missing = _uniq("slopensearch-missing")
     _put(client, a, "1", {"a": 1})
     _put(client, b, "1", {"b": 2})
     r = client.post(
@@ -922,7 +922,7 @@ def test_mget_unknown_body_key(client, idx):
 
 
 def test_mget_missing_index_in_path_returns_per_doc_error(client):
-    name = _uniq("slopsearch-missing")
+    name = _uniq("slopensearch-missing")
     r = client.post(f"/{name}/_mget", json={"ids": ["1"]})
     assert r.status_code == 200
     assert r.json()["docs"][0]["error"]["type"] == "index_not_found_exception"
@@ -1454,7 +1454,7 @@ def test_delete_by_query_does_not_see_unrefreshed_docs(client, idx):
 
 
 def test_delete_by_query_missing_index(client):
-    r = client.post(f"/{_uniq('slopsearch-missing')}/_delete_by_query", json={"query": {"match_all": {}}})
+    r = client.post(f"/{_uniq('slopensearch-missing')}/_delete_by_query", json={"query": {"match_all": {}}})
     assert r.status_code == 404
     assert _err_type(r) == "index_not_found_exception"
 
@@ -1905,7 +1905,7 @@ def test_bulk_require_alias_on_concrete_index(client, idx):
 
 
 def test_bulk_require_alias_with_alias_succeeds(client, idx):
-    alias = _uniq("slopsearch-alias")
+    alias = _uniq("slopensearch-alias")
     assert client.put(f"/{idx}/_alias/{alias}").status_code == 200
     try:
         r = _bulk(client, [{"index": {"_index": alias, "_id": "1", "require_alias": True}}, {"a": 1}])
@@ -1917,7 +1917,7 @@ def test_bulk_require_alias_with_alias_succeeds(client, idx):
 
 
 def test_bulk_require_alias_prevents_auto_create(client):
-    name = _uniq("slopsearch-auto")
+    name = _uniq("slopensearch-auto")
     r = _bulk(client, [{"index": {"_index": name, "_id": "1"}}, {"a": 1}], params={"require_alias": "true"})
     assert r.json()["items"][0]["index"]["status"] == 404
     assert client.head(f"/{name}").status_code == 404

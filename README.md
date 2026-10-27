@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/logo/logo-dark.svg">
-    <img src="docs/logo/logo-light.svg" alt="SlopSearch" width="420">
+    <img src="docs/logo/logo-light.svg" alt="SlopenSearch" width="480">
   </picture>
 </p>
 
@@ -11,11 +11,11 @@ The goal: same REST API, same responses, same errors — in a single small binar
 ---
 
 > [!NOTE]
-> SlopSearch is under active development and not production-ready yet: part of the API
+> SlopenSearch is under active development and not production-ready yet: part of the API
 > is still missing (see [Status](#status)), data lives in memory only, and there is no
 > authentication or TLS so far. Until those land, keep it on localhost or a trusted network.
 
-SlopSearch aims to speak the OpenSearch 3.9 REST API closely enough that an existing
+SlopenSearch aims to speak the OpenSearch 3.9 REST API closely enough that an existing
 client does not notice the difference. There are two independent implementations, one in
 **Go** and one in **Rust**, and both are measured against the same black-box test suite.
 
@@ -153,8 +153,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Security issues: [SECURITY.md](SECURITY.
 | Port | Service | Override in `.env` |
 |---|---|---|
 | 9290 | reference OpenSearch | `OPENSEARCH_PORT` |
-| 9291 | SlopSearch (Go) | `GO_PORT` |
-| 9292 | SlopSearch (Rust) | `RUST_PORT` |
+| 9291 | SlopenSearch (Go) | `GO_PORT` |
+| 9292 | SlopenSearch (Rust) | `RUST_PORT` |
 
 The servers themselves listen on `127.0.0.1:9200` by default; set `HOST` and `PORT` to
 change that (the Docker images use `HOST=0.0.0.0`, published on localhost only).
@@ -163,6 +163,6 @@ change that (the Docker images use `HOST=0.0.0.0`, published on localhost only).
 
 [Apache License 2.0](LICENSE).
 
-SlopSearch is an independent project. It is not affiliated with, endorsed by or
+SlopenSearch is an independent project. It is not affiliated with, endorsed by or
 sponsored by the OpenSearch Project or the Linux Foundation. OpenSearch is a trademark
 of LF Projects, LLC; the name is used here only to describe API compatibility.
