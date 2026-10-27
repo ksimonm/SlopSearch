@@ -25,7 +25,7 @@ func collectFieldTerms(idx *Index, field string) (map[string]int, []string) {
 	return freq, order
 }
 
-func evalSuggest(suggest map[string]any, idx *Index) map[string]any {
+func evalSuggest(suggest map[string]any, idx *Index, typed bool) map[string]any {
 	out := map[string]any{}
 	for name, raw := range suggest {
 		spec, ok := raw.(map[string]any)
@@ -33,11 +33,23 @@ func evalSuggest(suggest map[string]any, idx *Index) map[string]any {
 			continue
 		}
 		if t, ok := spec["term"].(map[string]any); ok {
-			out[name] = []any{termSuggester(spec, t, idx)}
+			key := name
+			if typed {
+				key = "term#" + name
+			}
+			out[key] = []any{termSuggester(spec, t, idx)}
 		} else if t, ok := spec["phrase"].(map[string]any); ok {
-			out[name] = []any{phraseSuggester(spec, t, idx)}
+			key := name
+			if typed {
+				key = "phrase#" + name
+			}
+			out[key] = []any{phraseSuggester(spec, t, idx)}
 		} else if t, ok := spec["completion"].(map[string]any); ok {
-			out[name] = []any{completionSuggester(spec, t, idx)}
+			key := name
+			if typed {
+				key = "completion#" + name
+			}
+			out[key] = []any{completionSuggester(spec, t, idx)}
 		}
 	}
 	return out

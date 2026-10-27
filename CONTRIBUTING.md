@@ -26,7 +26,7 @@ Rules:
   in the code you touch.
 
 Good areas to pick up: text analysis (`test_51`, `test_80`) and Painless (`test_43`)
-are the open work in the Rust server. In the Go server most areas are open, and the Rust
+are the open work in the Rust server. In the Go server, query types (`test_32`) and field types (`test_71`) are open too, and the Rust
 server is a ready-made reference for how they behave.
 
 ## Adding or fixing a test

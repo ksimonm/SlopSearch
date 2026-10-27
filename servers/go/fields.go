@@ -153,6 +153,10 @@ func (c *indexCtx) parseIntValue(name, typ string, def map[string]any, v any) (a
 		return c.parseIntString(name, typ, def, s, coerce, false)
 	case float64:
 		return c.parseIntFloat(name, typ, def, raw, coerce)
+	case int64:
+		return c.checkIntRange(name, typ, raw, float64(raw))
+	case int:
+		return c.checkIntRange(name, typ, int64(raw), float64(raw))
 	case bool:
 		return nil, c.fieldValueError(name, typ, v, "input_coercion_exception",
 			fmt.Sprintf("Cannot coerce value %v to %s", raw, typ))
@@ -244,7 +248,11 @@ func (c *indexCtx) parseIntString(name, typ string, def map[string]any, s string
 	iv, err := strconv.ParseInt(s, 10, 64)
 	if err != nil {
 		if ne, ok := err.(*strconv.NumError); ok && ne.Err == strconv.ErrRange {
-			return nil, c.fieldValueError(name, typ, orig, "illegal_argument_exception",
+			causeType := "input_coercion_exception"
+			if typ == "byte" {
+				causeType = "illegal_argument_exception"
+			}
+			return nil, c.fieldValueError(name, typ, orig, causeType,
 				fmt.Sprintf("Value [%s] is out of range for a %s", orig, typeDisplayName(typ)))
 		}
 		// integers accept decimal-like strings with coercion; floats parse natively
@@ -290,6 +298,10 @@ func (c *indexCtx) parseFloatValue(name, typ string, def map[string]any, v any) 
 		f = fv
 	case float64:
 		f = raw
+	case int64:
+		f = float64(raw)
+	case int:
+		f = float64(raw)
 	case bool:
 		return nil, c.fieldValueError(name, typ, v, "input_coercion_exception", "Cannot coerce boolean")
 	case string:
@@ -636,9 +648,22 @@ func (c *indexCtx) indexRawField(path string, def map[string]any, raw any) *apiE
 	if _, hasProps := def["properties"].(map[string]any); hasProps && (typ == "object" || typ == "nested") {
 		return c.indexObject(path, def, raw)
 	}
-	values, err := c.flattenScalars(path, raw)
-	if err != nil {
-		return err
+	var values []any
+	if typ == "geo_point" {
+		if arr, ok := raw.([]any); ok && len(arr) == 2 {
+			if _, ok1 := toFloat(arr[0]); ok1 {
+				if _, ok2 := toFloat(arr[1]); ok2 {
+					values = []any{raw}
+				}
+			}
+		}
+	}
+	if values == nil {
+		var err *apiError
+		values, err = c.flattenScalars(path, raw)
+		if err != nil {
+			return err
+		}
 	}
 	out := []any{}
 	ignoreMalformed := c.indexIgnoreMal
@@ -898,8 +923,13 @@ func (c *indexCtx) indexObjectMap(path string, props map[string]any, src map[str
 		if !declared {
 			// dynamic
 			dyn := "true"
-			if d, ok := c.idx.Mappings["dynamic"].(string); ok {
+			switch d := c.idx.Mappings["dynamic"].(type) {
+			case string:
 				dyn = d
+			case bool:
+				if !d {
+					dyn = "false"
+				}
 			}
 			if dyn == "strict" {
 				name := "root"
@@ -1053,6 +1083,20 @@ func (c *indexCtx) parseGeoPoint(path string, v any) (any, *apiError) {
 				return map[string]any{"lat": lat, "lon": lon}, nil
 			}
 		}
+		u := strings.ToUpper(strings.TrimSpace(t))
+		if strings.HasPrefix(u, "POINT") {
+			body := strings.TrimSpace(strings.TrimPrefix(u, "POINT"))
+			body = strings.TrimPrefix(body, "(")
+			body = strings.TrimSuffix(body, ")")
+			fs := strings.Fields(body)
+			if len(fs) == 2 {
+				lon, e1 := strconv.ParseFloat(fs[0], 64)
+				lat, e2 := strconv.ParseFloat(fs[1], 64)
+				if e1 == nil && e2 == nil {
+					return map[string]any{"lat": lat, "lon": lon}, nil
+				}
+			}
+		}
 		return nil, c.fieldValueError(path, "geo_point", v, "illegal_argument_exception", "failed to parse geo_point")
 	case map[string]any:
 		if lat, ok := toFloat(t["lat"]); ok {
@@ -1132,22 +1176,31 @@ func (c *indexCtx) parseJoin(path string, def map[string]any, v any) (any, *apiE
 		if name == "" {
 			return nil, c.fieldValueError(path, "join", v, "illegal_argument_exception", "join name is missing")
 		}
-		if _, ok := relations[name]; !ok {
-			children, ok2 := relations[parent]
-			valid := false
-			if ok2 {
-				if list, ok3 := children.([]any); ok3 {
-					for _, e := range list {
-						if s, ok := e.(string); ok && s == name {
-							valid = true
-						}
+		valid := false
+		for parentName, children := range relations {
+			if parentName == name {
+				valid = true
+				break
+			}
+			switch list := children.(type) {
+			case string:
+				if list == name {
+					valid = true
+				}
+			case []any:
+				for _, e := range list {
+					if s, ok := e.(string); ok && s == name {
+						valid = true
 					}
 				}
 			}
-			if !valid {
-				return nil, c.fieldValueError(path, "join", v, "illegal_argument_exception",
-					fmt.Sprintf("[%s] is not a valid join name", name))
+			if valid {
+				break
 			}
+		}
+		if !valid {
+			return nil, c.fieldValueError(path, "join", v, "illegal_argument_exception",
+				fmt.Sprintf("[%s] is not a valid join name", name))
 		}
 		return map[string]any{"name": name, "parent": parent}, nil
 	}

@@ -122,8 +122,17 @@ func (s *Server) nodeInfoForMetric(metric string) map[string]any {
 	case "plugins":
 		return map[string]any{"plugins": []any{}, "modules": modulesList()}
 	case "ingest":
+		types := make([]string, 0, len(knownProcessorTypes))
+		for t := range knownProcessorTypes {
+			types = append(types, t)
+		}
+		sort.Strings(types)
+		procs := make([]any, 0, len(types))
+		for _, t := range types {
+			procs = append(procs, map[string]any{"type": t})
+		}
 		return map[string]any{"ingest": map[string]any{
-			"processors": []any{},
+			"processors": procs,
 		}}
 	case "aggregations":
 		return map[string]any{"aggregations": map[string]any{}}

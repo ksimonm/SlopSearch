@@ -50,6 +50,11 @@ type Index struct {
 	ForceMerged    bool
 	DocValues      map[string]map[string][]any // doc id -> field path -> indexed values
 	DocIgnored     map[string][]string         // doc id -> ignored (malformed) fields
+	RawDocs        map[string][]byte           // doc id -> original _source bytes
+	Versions       map[string]int64
+	SeqNos         map[string]int64
+	PrimaryTerms   map[string]int64
+	NextSeq        int64
 }
 
 const versionCreated = "137307827"
@@ -173,6 +178,8 @@ type apiError struct {
 	TopType   string
 	TopReason string
 	RootCause *apiError
+	ForceTop  bool
+	Phase     string
 }
 
 func (e *apiError) Error() string { return e.Type + ": " + e.Reason }
@@ -201,7 +208,16 @@ type Server struct {
 	componentTemplates  map[string]map[string]any
 	dataStreams         map[string]*dataStreamInfo
 	ingestPipelines     map[string]map[string]any
+	searchPipelines     map[string]map[string]any
 	scripts             map[string]map[string]any
+	ingestMu            sync.RWMutex
+	scriptsMu           sync.RWMutex
+	scrolls             map[string]*scrollContext
+	scrollMu            sync.Mutex
+	scrollCounter       int64
+	pits                map[string]*pitContext
+	pitMu               sync.Mutex
+	pitCounter          int64
 }
 
 type dataStreamInfo struct {
@@ -223,7 +239,10 @@ func NewServer() *Server {
 		componentTemplates:  map[string]map[string]any{},
 		dataStreams:         map[string]*dataStreamInfo{},
 		ingestPipelines:     map[string]map[string]any{},
+		searchPipelines:     map[string]map[string]any{},
 		scripts:             map[string]map[string]any{},
+		scrolls:             map[string]*scrollContext{},
+		pits:                map[string]*pitContext{},
 	}
 }
 
@@ -331,6 +350,8 @@ func toFloat(v any) (float64, bool) {
 	case float64:
 		return t, true
 	case float32:
+		return float64(t), true
+	case rawFloat:
 		return float64(t), true
 	case int:
 		return float64(t), true
@@ -601,7 +622,7 @@ func inferType(v any) map[string]any {
 				props[k] = sub
 			}
 		}
-		return map[string]any{"type": "object", "properties": props}
+		return map[string]any{"properties": props}
 	}
 	return nil
 }
@@ -613,6 +634,20 @@ func ensureProperties(mappings map[string]any) map[string]any {
 		mappings["properties"] = props
 	}
 	return props
+}
+
+func mergeMappingForIndex(idx *Index, props, src map[string]any) {
+	switch d := idx.Mappings["dynamic"].(type) {
+	case bool:
+		if !d {
+			return
+		}
+	case string:
+		if d == "false" {
+			return
+		}
+	}
+	mergeMapping(props, src)
 }
 
 func mergeMapping(props map[string]any, src map[string]any) {

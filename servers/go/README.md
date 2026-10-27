@@ -33,11 +33,15 @@ To see what OpenSearch really answers for a request, run it against the referenc
 | `maps.go`, `fields.go` | mappings, index-time field extraction |
 | `alias.go`, `templates.go`, `datastreams.go`, `rollover.go` | aliases, index templates, data streams, rollover |
 | `resize.go`, `reindex.go`, `resolve_index.go`, `maintenance.go` | clone/shrink/split, `_reindex`, `_resolve/index`, refresh/flush/forcemerge |
-| `search.go`, `eval.go`, `eval_extra.go` | search API, query evaluation |
-| `aggs.go`, `suggest.go` | aggregations, suggesters |
+| `documents_v2.go`, `bulk_v2.go`, `byquery.go`, `termvectors.go` | document CRUD, `_bulk`, by-query APIs, term vectors |
+| `search.go`, `eval.go`, `eval_extra.go`, `highlight.go`, `explain.go`, `validate.go` | search API, query evaluation, highlighting, `_explain`, `_validate` |
+| `scroll.go`, `pit.go`, `msearch.go`, `search_templates.go`, `rank_eval.go` | scroll, point in time, `_msearch`, search templates, `_rank_eval` |
+| `search_pipelines.go`, `search_shards.go`, `shard_routing.go`, `field_caps.go` | search pipelines, `_search_shards`, routing, `_field_caps` |
+| `aggs.go`, `aggs_bucket.go`, `aggs_metric.go`, `aggs_significant.go`, `aggs_extra.go`, `suggest.go` | aggregations, suggesters |
+| `ingest.go`, `pipeline.go`, `ingest_processors.go`, `ingest_extra.go` | ingest pipelines and processors |
 | `cat.go`, `nodes.go`, `resp.go` | `_cat`, `_nodes`/`_cluster`, response formats (`filter_path`, YAML, ...) |
-| `painless.go` | minimal Painless/expression subset |
-| `analysis.go`, `ingest.go`, `scripts.go` | **stubs** — `_analyze`, ingest pipelines, stored scripts / `script_fields` |
+| `painless.go`, `script_eval.go`, `scripts.go` | Painless/expression subset, stored scripts, `script_fields` |
+| `analysis.go` | `_analyze` and analyzers (mostly open work) |
 
 ## Rules
 

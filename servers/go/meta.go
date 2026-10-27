@@ -1462,7 +1462,7 @@ func (s *Server) handlePutMapping(w http.ResponseWriter, r *http.Request, indexS
 	}
 	for _, idx := range indices {
 		props := ensureProperties(idx.Mappings)
-		mergeMapping(props, body)
+		mergeMappingForIndex(idx, props, body)
 		idx.MappingVersion++
 		ensureFieldTypes(idx)
 	}
@@ -1508,34 +1508,7 @@ func mergeSettings(dst, src map[string]any) map[string]any {
 // ------------------------------------------------------------- field caps
 
 func (s *Server) handleFieldCaps(w http.ResponseWriter, r *http.Request, indexSpec string) {
-	if r.Method != http.MethodGet && r.Method != http.MethodPost {
-		methodNotAllowed(w, r, "GET", "POST")
-		return
-	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	indices, apiErr := s.resolveIndices(indexSpec, resolveOpts{missing404: true, wildcardClosed: true})
-	if apiErr != nil {
-		writeError(w, apiErr)
-		return
-	}
-	fields := map[string]any{}
-	names := []any{}
-	for _, idx := range indices {
-		names = append(names, map[string]any{"name": idx.Name, "indices": []any{idx.Name}})
-		ensureFieldTypes(idx)
-		for field, ftype := range idx.FieldTypes {
-			entry, ok := fields[field].(map[string]any)
-			if !ok {
-				entry = map[string]any{}
-				fields[field] = entry
-			}
-			entry[ftype] = map[string]any{
-				"type": ftype, "metadata_field": false, "searchable": true, "aggregatable": ftype == "keyword" || ftype == "long" || ftype == "integer" || ftype == "float" || ftype == "double" || ftype == "boolean" || ftype == "date",
-			}
-		}
-	}
-	writeJSON(w, 200, map[string]any{"indices": []any{}, "fields": fields})
+	s.handleFieldCapsImpl(w, r, indexSpec)
 }
 
 // -------------------------------------------------------------- server routes

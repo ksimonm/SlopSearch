@@ -12,11 +12,41 @@ import (
 // ---------------------------------------------------------------------------
 
 type scriptEnv struct {
-	c      *queryCtx
-	params map[string]any
+	c          *queryCtx
+	params     map[string]any
+	ctxSource  map[string]any
+	ctxIndex   string
+	ctxID      string
+	ctxVersion int64
 }
 
 func (e *scriptEnv) resolvePath(path string) any {
+	if path == "ctx._source" {
+		return e.ctxSource
+	}
+	if strings.HasPrefix(path, "ctx._source.") {
+		parts := strings.Split(strings.TrimPrefix(path, "ctx._source."), ".")
+		var cur any = e.ctxSource
+		for _, p := range parts {
+			m, ok := cur.(map[string]any)
+			if !ok {
+				return nil
+			}
+			cur, ok = m[p]
+			if !ok {
+				return nil
+			}
+		}
+		return cur
+	}
+	switch path {
+	case "ctx._index":
+		return e.ctxIndex
+	case "ctx._id":
+		return e.ctxID
+	case "ctx._version":
+		return e.ctxVersion
+	}
 	// doc['field'].value
 	if strings.HasPrefix(path, "doc[") {
 		i := strings.Index(path, "]")
@@ -24,6 +54,15 @@ func (e *scriptEnv) resolvePath(path string) any {
 			return nil
 		}
 		field := strings.Trim(path[4:i], "'\"")
+		vals, _ := e.c.values(field)
+		if len(vals) == 0 {
+			return nil
+		}
+		return vals[0]
+	}
+	if strings.HasPrefix(path, "doc.") {
+		field := strings.TrimPrefix(path, "doc.")
+		field = strings.TrimSuffix(field, ".value")
 		vals, _ := e.c.values(field)
 		if len(vals) == 0 {
 			return nil

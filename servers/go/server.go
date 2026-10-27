@@ -38,9 +38,20 @@ func (c *captureWriter) Write(b []byte) (int, error) {
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=UTF-8")
 	w.WriteHeader(status)
-	enc := json.NewEncoder(w)
+	switch t := v.(type) {
+	case orderedJSON:
+		b, _ := t.MarshalJSON()
+		w.Write(b)
+		return
+	case verbatimJSON:
+		w.Write(t)
+		return
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
 	enc.Encode(v)
+	w.Write(bytes.TrimRight(buf.Bytes(), "\n"))
 }
 
 func writeError(w http.ResponseWriter, e *apiError) {
@@ -59,6 +70,9 @@ func writeError(w http.ResponseWriter, e *apiError) {
 	}
 	if e.TopReason != "" {
 		err["reason"] = e.TopReason
+	}
+	if e.Phase != "" {
+		err["phase"] = e.Phase
 	}
 	fields := map[string]any{}
 	for k, v := range e.Fields {
@@ -89,9 +103,20 @@ func writeError(w http.ResponseWriter, e *apiError) {
 		rootCause[k] = v
 	}
 	if e.CausedBy != nil {
-		err["caused_by"] = map[string]any{"type": e.CausedBy.Type, "reason": e.CausedBy.Reason}
+		err["caused_by"] = causedByObject(e.CausedBy)
 	}
 	writeJSON(w, e.Status, map[string]any{"error": err, "status": e.Status})
+}
+
+func causedByObject(e *apiError) map[string]any {
+	m := map[string]any{"type": e.Type, "reason": e.Reason}
+	for k, v := range e.Fields {
+		m[k] = v
+	}
+	if e.CausedBy != nil {
+		m["caused_by"] = causedByObject(e.CausedBy)
+	}
+	return m
 }
 
 func writeSimpleError(w http.ResponseWriter, status int, msg string) {
@@ -110,13 +135,70 @@ func readJSON(r *http.Request) (map[string]any, *apiError) {
 		return nil, errBad("failed to read body")
 	}
 	if len(strings.TrimSpace(string(body))) == 0 {
-		return map[string]any{}, nil
+		if src := r.URL.Query().Get("source"); src != "" {
+			body = []byte(src)
+		} else {
+			return map[string]any{}, nil
+		}
+	}
+	if err := checkDuplicateJSONKeys(body); err != nil {
+		return nil, &apiError{Type: "json_parse_exception", Status: 400, Reason: err.Error()}
+	}
+	trimmed := strings.TrimSpace(string(body))
+	if strings.HasPrefix(trimmed, "[") {
+		return nil, &apiError{Type: "parsing_exception", Status: 400,
+			Reason: "Expected [START_OBJECT] but found [START_ARRAY]"}
 	}
 	var out map[string]any
 	if err := unmarshalJSON(body, &out); err != nil {
-		return nil, errBad("Failed to parse request body: " + err.Error())
+		return nil, &apiError{Type: "json_parse_exception", Status: 400,
+			Reason: "Failed to parse request body: " + err.Error()}
 	}
 	return out, nil
+}
+
+func checkDuplicateJSONKeys(body []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	var walk func() error
+	walk = func() error {
+		tok, err := dec.Token()
+		if err != nil {
+			return nil
+		}
+		delim, ok := tok.(json.Delim)
+		if !ok {
+			return nil
+		}
+		switch delim {
+		case '{':
+			seen := map[string]bool{}
+			for dec.More() {
+				kt, err := dec.Token()
+				if err != nil {
+					return nil
+				}
+				k, _ := kt.(string)
+				if seen[k] {
+					return fmt.Errorf("Duplicate Object property %q", k)
+				}
+				seen[k] = true
+				if err := walk(); err != nil {
+					return err
+				}
+			}
+			_, _ = dec.Token()
+		case '[':
+			for dec.More() {
+				if err := walk(); err != nil {
+					return err
+				}
+			}
+			_, _ = dec.Token()
+		}
+		return nil
+	}
+	return walk()
 }
 
 func (s *Server) getIndex(name string) (*Index, *apiError) {
@@ -259,7 +341,15 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if segs[0] == "_bulk" {
-		s.handleBulk(w, r, "")
+		s.handleBulkV2(w, r, "")
+		return
+	}
+	if segs[0] == "_msearch" {
+		if len(segs) >= 2 && segs[1] == "template" {
+			s.handleMsearchTemplate(w, r, "")
+			return
+		}
+		s.handleMsearch(w, r, "")
 		return
 	}
 	if segs[0] == "_ingest" {
@@ -269,8 +359,20 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		writeNoHandler(w, r)
 		return
 	}
-	if segs[0] == "_scripts" || segs[0] == "_render" {
+	if segs[0] == "_scripts" {
 		if s.handleScriptsRoute(w, r, segs) {
+			return
+		}
+		writeNoHandler(w, r)
+		return
+	}
+	if segs[0] == "_render" {
+		if len(segs) >= 2 && segs[1] == "template" {
+			id := ""
+			if len(segs) >= 3 {
+				id = strings.Join(segs[2:], "/")
+			}
+			s.handleRenderTemplate(w, r, id)
 			return
 		}
 		writeNoHandler(w, r)
@@ -281,11 +383,44 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if segs[0] == "_search" {
+		if len(segs) >= 2 && segs[1] == "template" {
+			s.handleSearchTemplate(w, r, "")
+			return
+		}
+		if len(segs) >= 2 && segs[1] == "point_in_time" {
+			s.handlePitRoute(w, r, segs[2:])
+			return
+		}
+		if len(segs) >= 2 && segs[1] == "scroll" {
+			s.handleScroll(w, r, segs[2:])
+			return
+		}
+		if len(segs) >= 2 && segs[1] == "pipeline" {
+			if s.handleSearchPipelineRoute(w, r, segs) {
+				return
+			}
+		}
 		s.handleSearch(w, r, "")
 		return
 	}
 	if segs[0] == "_count" {
 		s.handleCount(w, r, "")
+		return
+	}
+	if segs[0] == "_search_shards" {
+		s.handleSearchShards(w, r, "")
+		return
+	}
+	if segs[0] == "_rank_eval" {
+		s.handleRankEval(w, r, "")
+		return
+	}
+	if segs[0] == "_validate" {
+		if len(segs) >= 2 && segs[1] == "query" {
+			s.handleValidateQuery(w, r, "")
+			return
+		}
+		writeNoHandler(w, r)
 		return
 	}
 	if segs[0] == "_field_caps" {
@@ -318,6 +453,9 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeNoHandler(w, r)
+		return
+	case "_mget":
+		s.handleMget(w, r, "")
 		return
 	case "_stats":
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -396,6 +534,21 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		s.handleCat(w, r, segs[1:])
 		return
 	}
+	if segs[0] == "_all" || segs[0] == "*" {
+		if len(segs) == 2 {
+			switch segs[1] {
+			case "_search":
+				s.handleSearch(w, r, segs[0])
+				return
+			case "_count":
+				s.handleCount(w, r, segs[0])
+				return
+			case "_field_caps":
+				s.handleFieldCaps(w, r, segs[0])
+				return
+			}
+		}
+	}
 	if strings.HasPrefix(segs[0], "_") {
 		if r.Method == http.MethodPut {
 			s.createIndex(w, r, segs[0])
@@ -445,11 +598,41 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		case "_analyze":
 			s.handleAnalyze(w, r, index)
 		case "_bulk":
-			s.handleBulk(w, r, index)
+			s.handleBulkV2(w, r, index)
+		case "_msearch":
+			s.handleMsearch(w, r, index)
+		case "_mget":
+			s.handleMget(w, r, index)
+		case "_termvectors":
+			if len(segs) == 2 {
+				s.handleTermVectors(w, r, index, "")
+			} else {
+				s.handleTermVectors(w, r, index, segs[2])
+			}
+		case "_mtermvectors":
+			s.handleMTermVectors(w, r, index)
+		case "_delete_by_query":
+			s.handleDeleteByQuery(w, r, index)
+		case "_update_by_query":
+			s.handleUpdateByQuery(w, r, index)
 		case "_search":
+			if len(segs) >= 3 && segs[2] == "point_in_time" {
+				s.openPit(w, r, index)
+				return
+			}
 			s.handleSearch(w, r, index)
 		case "_count":
 			s.handleCount(w, r, index)
+		case "_search_shards":
+			s.handleSearchShards(w, r, index)
+		case "_rank_eval":
+			s.handleRankEval(w, r, index)
+		case "_validate":
+			if len(segs) >= 3 && segs[2] == "query" {
+				s.handleValidateQuery(w, r, index)
+				return
+			}
+			writeNoHandler(w, r)
 		case "_field_caps":
 			s.handleFieldCaps(w, r, index)
 		case "_refresh", "_flush", "_forcemerge":
@@ -491,7 +674,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 			}
 		case "_doc":
 			if r.Method == http.MethodPost {
-				s.handleIndexDoc(w, r, index, "", "index")
+				s.handleIndexDocV2(w, r, index, "", "index")
 			} else {
 				methodNotAllowed(w, r, "POST")
 			}
@@ -500,29 +683,55 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		}
 	case 3:
 		switch segs[1] {
+		case "_validate":
+			if segs[2] == "query" {
+				s.handleValidateQuery(w, r, index)
+				return
+			}
+			writeNoHandler(w, r)
+		case "_msearch":
+			if segs[2] == "template" {
+				s.handleMsearchTemplate(w, r, index)
+				return
+			}
+			writeNoHandler(w, r)
+		case "_search":
+			if segs[2] == "template" {
+				s.handleSearchTemplate(w, r, index)
+				return
+			}
+			if segs[2] == "point_in_time" {
+				s.openPit(w, r, index)
+				return
+			}
+			writeNoHandler(w, r)
 		case "_doc":
 			switch r.Method {
 			case http.MethodPut, http.MethodPost:
-				s.handleIndexDoc(w, r, index, segs[2], "index")
+				s.handleIndexDocV2(w, r, index, segs[2], "index")
 			case http.MethodGet, http.MethodHead:
-				s.handleGetDoc(w, r, index, segs[2])
+				s.handleGetDocV2(w, r, index, segs[2])
 			case http.MethodDelete:
-				s.handleDeleteDoc(w, r, index, segs[2])
+				s.handleDeleteDocV2(w, r, index, segs[2])
 			}
 		case "_source":
 			if r.Method != http.MethodGet && r.Method != http.MethodHead {
 				methodNotAllowed(w, r, "GET", "HEAD")
 				return
 			}
-			s.handleGetSource(w, r, index, segs[2])
+			s.handleGetSourceV2(w, r, index, segs[2])
+		case "_termvectors":
+			s.handleTermVectors(w, r, index, segs[2])
 		case "_update":
-			s.handleUpdateDoc(w, r, index, segs[2])
+			s.handleUpdateDocV2(w, r, index, segs[2])
+		case "_explain":
+			s.handleExplain(w, r, index, segs[2])
 		case "_rollover":
 			s.handleRollover(w, r, index, segs[2])
 		case "_clone", "_shrink", "_split":
 			s.handleResize(w, r, index, strings.TrimPrefix(segs[1], "_"), segs[2])
 		case "_create":
-			s.handleIndexDoc(w, r, index, segs[2], "create")
+			s.handleIndexDocV2(w, r, index, segs[2], "create")
 		case "_alias", "_aliases":
 			switch r.Method {
 			case http.MethodGet, http.MethodHead:
@@ -963,7 +1172,7 @@ func (s *Server) handleIndexDoc(w http.ResponseWriter, r *http.Request, name, id
 		writeError(w, derr)
 		return
 	}
-	mergeMapping(props, body)
+	mergeMappingForIndex(idx, props, body)
 	idx.FieldTypes = map[string]string{}
 	buildFieldTypes(idx.Mappings, "", idx.FieldTypes)
 	if id == "" {
@@ -1129,7 +1338,7 @@ func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request, name, i
 	}
 	if patch, ok := body["doc"].(map[string]any); ok {
 		props := ensureProperties(idx.Mappings)
-		mergeMapping(props, patch)
+		mergeMappingForIndex(idx, props, patch)
 		idx.FieldTypes = map[string]string{}
 		buildFieldTypes(idx.Mappings, "", idx.FieldTypes)
 		for k, v := range patch {
@@ -1187,20 +1396,29 @@ func (s *Server) resolveReadTarget(name string) (*Index, *apiError) {
 }
 
 func parseQParam(q string) map[string]any {
-	idx := strings.Index(q, ":")
-	if idx <= 0 {
-		if q == "*" || q == "" {
-			return map[string]any{"match_all": map[string]any{}}
-		}
-		return map[string]any{"match": map[string]any{"_all": q}}
+	m, _ := parseQParamOpts(q, "", "")
+	return m
+}
+
+func parseQParamOpts(q, df, op string) (map[string]any, *apiError) {
+	if op != "" && !strings.EqualFold(op, "and") && !strings.EqualFold(op, "or") {
+		return nil, &apiError{Type: "illegal_argument_exception", Status: 400,
+			Reason: "No enum constant org.opensearch.index.query.Operator." + strings.ToUpper(op)}
 	}
-	field := q[:idx]
-	value := q[idx+1:]
-	var typed any = value
-	if f, err := strconv.ParseFloat(value, 64); err == nil {
-		typed = f
+	if q == "" {
+		return map[string]any{"match_none": map[string]any{}}, nil
 	}
-	return map[string]any{"term": map[string]any{field: typed}}
+	if q == "*" {
+		return map[string]any{"match_all": map[string]any{}}, nil
+	}
+	qs := map[string]any{"query": q}
+	if df != "" {
+		qs["default_field"] = df
+	}
+	if op != "" {
+		qs["default_operator"] = strings.ToUpper(op)
+	}
+	return map[string]any{"query_string": qs}, nil
 }
 
 func (s *Server) handleCount(w http.ResponseWriter, r *http.Request, name string) {
@@ -1222,10 +1440,27 @@ func (s *Server) handleCount(w http.ResponseWriter, r *http.Request, name string
 		writeError(w, apiErr)
 		return
 	}
+	if pipe, pipeErr := s.resolveSearchPipeline(r, body, indices); pipeErr != nil {
+		writeError(w, pipeErr)
+		return
+	} else if pipe != nil {
+		if _, _, perr := applySearchRequestProcessors(body, pipe, false); perr != nil {
+			writeError(w, perr)
+			return
+		}
+	}
 	query, _ := body["query"].(map[string]any)
-	if query == nil {
-		if qp := r.URL.Query().Get("q"); qp != "" {
-			query = parseQParam(qp)
+	if vals, has := r.URL.Query()["q"]; has {
+		if query != nil {
+			writeError(w, &apiError{Type: "illegal_argument_exception", Status: 400,
+				Reason: "request [/" + name + "/_count] contains unrecognized parameter: [q]"})
+			return
+		}
+		var qerr *apiError
+		query, qerr = parseQParamOpts(vals[0], r.URL.Query().Get("df"), r.URL.Query().Get("default_operator"))
+		if qerr != nil {
+			writeError(w, qerr)
+			return
 		}
 	}
 	matchAll := false
@@ -1237,15 +1472,23 @@ func (s *Server) handleCount(w http.ResponseWriter, r *http.Request, name string
 	}
 	total := 0
 	shards := 0
+	sf := newShardFilter(r, indices)
 	for _, idx := range indices {
 		q := query
 		if f := searchAliasFilter(idx, name); f != nil {
 			q = map[string]any{"bool": map[string]any{"must": []any{query, f}}}
 		}
-		shards += idx.numShards()
+		if sf != nil {
+			shards += len(sf.allowed[idx])
+		} else {
+			shards += idx.numShards()
+		}
 		for _, id := range idx.Order {
 			doc, live := idx.Docs[id]
 			if !live {
+				continue
+			}
+			if !sf.allows(idx, id) {
 				continue
 			}
 			if _, pending := idx.Pending[id]; pending {
@@ -1254,6 +1497,18 @@ func (s *Server) handleCount(w http.ResponseWriter, r *http.Request, name string
 			qc := newQueryCtxForDoc(idx, id, doc)
 			matched, _, err := qc.eval(q)
 			if err != nil {
+				if err.Type == "illegal_argument_exception" && strings.Contains(err.Reason, "failed to parse value [") {
+					val := err.Reason
+					if i := strings.Index(val, "["); i >= 0 {
+						if j := strings.Index(val[i+1:], "]"); j >= 0 {
+							val = val[i+1 : i+1+j]
+						}
+					}
+					reason := "failed to create query: For input string: \"" + val + "\""
+					writeError(w, &apiError{Type: "search_phase_execution_exception", Status: 400, Reason: reason,
+						RootCause: &apiError{Type: "query_shard_exception", Reason: reason}})
+					return
+				}
 				writeError(w, err)
 				return
 			}
@@ -1392,7 +1647,7 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request, name string)
 				continue
 			}
 			props := ensureProperties(idx.Mappings)
-			mergeMapping(props, source)
+			mergeMappingForIndex(idx, props, source)
 			idx.FieldTypes = map[string]string{}
 			buildFieldTypes(idx.Mappings, "", idx.FieldTypes)
 			for k, v := range source {
@@ -1440,7 +1695,7 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request, name string)
 			items = append(items, bulkErrAPI(op, idx.Name, docID, derr))
 			continue
 		}
-		mergeMapping(props, source)
+		mergeMappingForIndex(idx, props, source)
 		idx.FieldTypes = map[string]string{}
 		buildFieldTypes(idx.Mappings, "", idx.FieldTypes)
 		if docID == "" {

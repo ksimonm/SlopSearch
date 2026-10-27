@@ -3,8 +3,11 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net"
+	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -46,6 +49,12 @@ func (c *queryCtx) values(field string) ([]any, bool) {
 	resolved := resolveAliasField(c.idx, field)
 	if resolved == "_id" {
 		return []any{c.id}, true
+	}
+	if resolved == "_routing" {
+		if rv, ok := c.idx.Routing[c.id]; ok && rv != "" {
+			return []any{rv}, true
+		}
+		return nil, false
 	}
 	if dv, ok := c.rawValues(); ok {
 		if vals, ok := dv[resolved]; ok {
@@ -119,6 +128,11 @@ func mappingFieldDef(idx *Index, field string) (map[string]any, bool) {
 		}
 		if i == len(parts)-1 {
 			return def, true
+		}
+		if fields, ok := def["fields"].(map[string]any); ok && i+1 == len(parts)-1 {
+			if md, ok := fields[parts[i+1]].(map[string]any); ok {
+				return md, true
+			}
 		}
 		sub, ok := def["properties"].(map[string]any)
 		if !ok {
@@ -507,6 +521,19 @@ func rangeRelation(relation string, qLower, qUpper any, hasLower, hasUpper bool,
 // ---------------------------------------------------------------------------
 
 func (c *queryCtx) evalTerm(field string, raw any, boost float64) (bool, float64, *apiError) {
+	if field == "_id" {
+		val := raw
+		if m, ok := raw.(map[string]any); ok {
+			if v, ok := m["value"]; ok {
+				val = v
+			}
+		}
+		s, _ := valueScalarString(val)
+		if s == c.id {
+			return true, boost, nil
+		}
+		return false, 0, nil
+	}
 	val := raw
 	fuzz := 0
 	if m, ok := raw.(map[string]any); ok {
@@ -919,7 +946,7 @@ func (c *queryCtx) evalRange(field string, cond map[string]any, boost float64) (
 		ok := true
 		for op, bound := range cond {
 			switch op {
-			case "boost", "relation", "time_zone", "format":
+			case "boost", "relation", "time_zone", "format", "_name":
 				continue
 			}
 			bv, err := parseBound(bound)
@@ -1213,7 +1240,7 @@ func (c *queryCtx) evalRegexp(field string, raw any, boost float64) (bool, float
 func (c *queryCtx) evalFuzzy(field string, raw any, boost float64) (bool, float64, *apiError) {
 	m, ok := raw.(map[string]any)
 	if !ok {
-		return false, 0, errParsing("[fuzzy] query requires an object")
+		m = map[string]any{"value": raw}
 	}
 	val, has := m["value"]
 	if !has {
@@ -1241,7 +1268,6 @@ func (c *queryCtx) evalFuzzy(field string, raw any, boost float64) (bool, float6
 	if me, ok := toFloat(m["max_expansions"]); ok {
 		maxExpansions = int(me)
 	}
-	_ = transpositions
 	def, _ := mappingFieldDef(c.idx, field)
 	ftype, _ := def["type"].(string)
 	vals, present := c.values(field)
@@ -1265,7 +1291,7 @@ func (c *queryCtx) evalFuzzy(field string, raw any, boost float64) (bool, float6
 			if cand[:prefixLength] != term[:prefixLength] {
 				continue
 			}
-			if levenshtein(cand, term) <= fuzz {
+			if fuzzyDistance(cand, term, transpositions) <= fuzz {
 				if maxExpansions > 0 && matched >= maxExpansions {
 					continue
 				}
@@ -1334,35 +1360,329 @@ func (c *queryCtx) analyzerName(field string, opts any) string {
 
 func (c *queryCtx) analyzeField(field string, opts any, text string) []string {
 	a := c.analyzerName(field, opts)
-	if a == "" {
-		return analyze(text)
-	}
 	return analyzeWithIndex(c.idx, a, text)
 }
 
+func matchSearchError(rootType, reason string) *apiError {
+	return &apiError{Type: "search_phase_execution_exception", Status: 400, Reason: "all shards failed",
+		RootCause: &apiError{Type: rootType, Status: 400, Reason: reason},
+		CausedBy:  &apiError{Type: rootType, Status: 400, Reason: reason}}
+}
+
+func parseFuzzinessValue(v any, term string) (int, bool) {
+	switch t := v.(type) {
+	case string:
+		u := strings.ToUpper(strings.TrimSpace(t))
+		if u == "AUTO" {
+			return autoFuzziness(term), true
+		}
+		if strings.HasPrefix(u, "AUTO:") {
+			parts := strings.Split(strings.TrimPrefix(u, "AUTO:"), ",")
+			low, high := 3, 6
+			if len(parts) > 0 {
+				if n, err := strconv.Atoi(strings.TrimSpace(parts[0])); err == nil {
+					low = n
+				}
+			}
+			if len(parts) > 1 {
+				if n, err := strconv.Atoi(strings.TrimSpace(parts[1])); err == nil {
+					high = n
+				}
+			}
+			n := len([]rune(term))
+			if n < low {
+				return 0, true
+			}
+			if n <= high {
+				return 1, true
+			}
+			return 2, true
+		}
+		if n, err := strconv.Atoi(u); err == nil {
+			if n > 2 {
+				n = 2
+			}
+			return n, true
+		}
+		return 0, false
+	case json.Number:
+		n, err := t.Int64()
+		if err != nil {
+			f, ferr := t.Float64()
+			if ferr != nil {
+				return 0, false
+			}
+			n = int64(f)
+		}
+		if n > 2 {
+			n = 2
+		}
+		return int(n), true
+	case float64:
+		n := int(t)
+		if n > 2 {
+			n = 2
+		}
+		return n, true
+	case int:
+		if t > 2 {
+			t = 2
+		}
+		return t, true
+	}
+	return 0, false
+}
+
+func fuzzyDistance(a, b string, transpositions bool) int {
+	ar, br := []rune(a), []rune(b)
+	if !transpositions {
+		return levenshtein(a, b)
+	}
+	prev2 := make([]int, len(br)+1)
+	prev := make([]int, len(br)+1)
+	curr := make([]int, len(br)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(ar); i++ {
+		curr[0] = i
+		for j := 1; j <= len(br); j++ {
+			cost := 1
+			if ar[i-1] == br[j-1] {
+				cost = 0
+			}
+			curr[j] = min(prev[j]+1, min(curr[j-1]+1, prev[j-1]+cost))
+			if i > 1 && j > 1 && ar[i-1] == br[j-2] && ar[i-2] == br[j-1] {
+				if v := prev2[j-2] + 1; v < curr[j] {
+					curr[j] = v
+				}
+			}
+		}
+		prev2, prev, curr = prev, curr, prev2
+	}
+	return prev[len(br)]
+}
+
+func msmRequired(spec any, n int, defaultAll bool) (int, *apiError) {
+	def := 1
+	if defaultAll {
+		def = n
+	}
+	if spec == nil {
+		return def, nil
+	}
+	if s, ok := spec.(string); ok {
+		text := strings.TrimSpace(s)
+		if strings.Contains(text, "<") {
+			for _, rule := range strings.Fields(text) {
+				if i := strings.Index(rule, "<"); i > 0 {
+					cond, err := strconv.Atoi(rule[:i])
+					if err == nil && n > cond {
+						return msmRequired(rule[i+1:], n, defaultAll)
+					}
+				}
+			}
+			return n, nil
+		}
+		if strings.HasSuffix(text, "%") {
+			p, err := strconv.Atoi(strings.TrimSuffix(text, "%"))
+			if err != nil {
+				return 0, matchSearchError("query_shard_exception", "failed to create query: For input string: \""+text+"\"")
+			}
+			if p >= 0 {
+				req := int(math.Floor(float64(n) * float64(p) / 100.0))
+				if req < 1 {
+					req = 1
+				}
+				return req, nil
+			}
+			req := n - int(math.Floor(float64(n)*float64(-p)/100.0))
+			if req < 1 {
+				req = 1
+			}
+			return req, nil
+		}
+		if k, err := strconv.Atoi(text); err == nil {
+			if k < 0 {
+				k = n + k
+				if k < 1 {
+					k = 1
+				}
+			}
+			return k, nil
+		}
+		return 0, matchSearchError("query_shard_exception", "failed to create query: For input string: \""+text+"\"")
+	}
+	if f, ok := toFloat(spec); ok {
+		k := int(f)
+		if k < 0 {
+			k = n + k
+			if k < 1 {
+				k = 1
+			}
+		}
+		return k, nil
+	}
+	return 0, matchSearchError("query_shard_exception", "failed to create query: For input string: \""+fmt.Sprint(spec)+"\"")
+}
+
+func matchAnalyzerExists(idx *Index, name string) bool {
+	switch name {
+	case "standard", "simple", "whitespace", "keyword", "stop", "english", "lowercase", "pattern", "fingerprint":
+		return true
+	}
+	if idx != nil {
+		if _, ok := findSetting(idx.Settings, "analysis.analyzer."+name); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *queryCtx) fieldHasAnalyzedTerm(field, term string) bool {
+	for _, v := range c.mustValues(field) {
+		s, _ := valueScalarString(v)
+		for _, tok := range c.analyzeField(field, nil, s) {
+			if tok == term {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (c *queryCtx) phraseMatchesTerms(field string, terms []string) bool {
+	if len(terms) == 0 {
+		return false
+	}
+	def, _ := mappingFieldDef(c.idx, field)
+	gap := 100
+	if g, ok := toFloat(def["position_increment_gap"]); ok {
+		gap = int(g)
+	}
+	doc := []analyzedToken{}
+	lastPos := -1
+	for _, v := range c.mustValues(field) {
+		s, _ := valueScalarString(v)
+		toks := analyzeTokensWithIndex(c.idx, c.analyzerName(field, nil), s)
+		base := 0
+		if lastPos >= 0 {
+			base = lastPos + gap + 1
+		}
+		for _, t := range toks {
+			doc = append(doc, analyzedToken{term: t.term, pos: t.pos + base})
+			if t.pos+base > lastPos {
+				lastPos = t.pos + base
+			}
+		}
+	}
+	qtokens := make([]analyzedToken, len(terms))
+	for i, t := range terms {
+		qtokens[i] = analyzedToken{term: t, pos: i}
+	}
+	return phraseCost(doc, qtokens, 0)
+}
+
 func (c *queryCtx) evalMatch(field string, raw any, boost float64) (bool, float64, *apiError) {
+	if field == "_id" {
+		text, _ := queryText(raw)
+		if text == c.id {
+			return true, boost, nil
+		}
+		return false, 0, nil
+	}
+	if _, isArr := raw.([]any); isArr {
+		return false, 0, &apiError{Type: "illegal_state_exception", Status: 500,
+			Reason: "Can only use match queries on text fields"}
+	}
 	text, opts := queryText(raw)
-	if m, ok := opts.(map[string]any); ok {
+	m, _ := opts.(map[string]any)
+	if m == nil {
+		if _, isMap := raw.(map[string]any); isMap {
+			return false, 0, errParsing("No text specified for text query")
+		}
+		if raw == nil {
+			return false, 0, errParsing("No text specified for text query")
+		}
+	} else {
+		allowed := map[string]bool{"query": true, "operator": true, "analyzer": true,
+			"minimum_should_match": true, "fuzziness": true, "fuzzy_transpositions": true,
+			"prefix_length": true, "max_expansions": true, "lenient": true, "zero_terms_query": true,
+			"boost": true, "auto_generate_synonyms_phrase_query": true, "fuzzy_rewrite": true,
+			"cutoff_frequency": true}
+		for k := range m {
+			if !allowed[k] {
+				return false, 0, errParsing("[match] query does not support [" + k + "]")
+			}
+		}
+		if _, has := m["query"]; !has {
+			return false, 0, errParsing("No text specified for text query")
+		}
+	}
+	operator := "or"
+	if m != nil {
+		if o, ok := m["operator"].(string); ok {
+			u := strings.ToUpper(o)
+			if u != "AND" && u != "OR" {
+				return false, 0, &apiError{Type: "illegal_argument_exception", Status: 400,
+					Reason: "No enum constant org.opensearch.index.query.Operator." + u}
+			}
+			operator = strings.ToLower(u)
+		}
+		if a, ok := m["analyzer"].(string); ok && a != "" && !matchAnalyzerExists(c.idx, a) {
+			return false, 0, matchSearchError("query_shard_exception", "[match] analyzer ["+a+"] not found")
+		}
+		if z, ok := m["zero_terms_query"].(string); ok {
+			u := strings.ToUpper(z)
+			if u != "NONE" && u != "ALL" {
+				return false, 0, errParsing("Unsupported zero_terms_query value [" + z + "]")
+			}
+		}
 		if b, ok := toFloat(m["boost"]); ok {
 			boost *= b
 		}
 	}
 	def, _ := mappingFieldDef(c.idx, field)
 	ftype, _ := def["type"].(string)
-	operator := "or"
-	if m, ok := opts.(map[string]any); ok {
-		if o, ok := m["operator"].(string); ok {
-			operator = strings.ToLower(o)
+	lenient := false
+	if m != nil {
+		if b, ok := m["lenient"].(bool); ok {
+			lenient = b
 		}
 	}
-	vals, present := c.values(field)
-	if !present {
-		return false, 0, nil
+	fuzzSpec, hasFuzziness := any(nil), false
+	if m != nil {
+		fuzzSpec, hasFuzziness = m["fuzziness"]
 	}
 	if isNumericType(ftype) || ftype == "boolean" || ftype == "date" || ftype == "date_nanos" || ftype == "ip" {
+		vals, present := c.values(field)
+		if !present {
+			return false, 0, nil
+		}
+		if hasFuzziness {
+			return false, 0, matchSearchError("query_shard_exception",
+				"Can only use fuzzy queries on keyword and text fields - not on ["+field+"] which is of type ["+ftype+"]")
+		}
 		parsed, err := parseTermValue(ftype, def, text)
 		if err != nil {
-			return false, 0, nil
+			if lenient {
+				return false, 0, nil
+			}
+			switch {
+			case ftype == "date" || ftype == "date_nanos":
+				return false, 0, matchSearchError("parse_exception",
+					"failed to parse date field ["+text+"] with format ["+dateFormatOf(def)+"]")
+			case isNumericType(ftype):
+				me := matchSearchError("query_shard_exception",
+					"failed to create query: For input string: \""+text+"\"")
+				me.CausedBy.CausedBy = &apiError{Type: "number_format_exception", Status: 400,
+					Reason: "For input string: \"" + text + "\""}
+				return false, 0, me
+			case ftype == "boolean":
+				return false, 0, matchSearchError("query_shard_exception", "Can't parse boolean value ["+text+"]")
+			default:
+				return false, 0, matchSearchError("query_shard_exception", err.Reason)
+			}
 		}
 		for _, v := range vals {
 			for _, p := range parsed {
@@ -1382,6 +1702,10 @@ func (c *queryCtx) evalMatch(field string, raw any, boost float64) (bool, float6
 		return false, 0, nil
 	}
 	if ftype == "keyword" || ftype == "constant_keyword" || ftype == "wildcard" || ftype == "flat_object" {
+		vals, present := c.values(field)
+		if !present {
+			return false, 0, nil
+		}
 		for _, v := range vals {
 			s, _ := valueScalarString(v)
 			if s == text {
@@ -1390,20 +1714,130 @@ func (c *queryCtx) evalMatch(field string, raw any, boost float64) (bool, float6
 		}
 		return false, 0, nil
 	}
-	qtokens := c.analyzeField(field, opts, text)
-	if len(qtokens) == 0 {
+	analyzer := c.analyzerName(field, opts)
+	if alts, matched := synonymAlternatives(c.idx, analyzer, text); matched {
+		auto := true
+		if m != nil {
+			if v, ok := m["auto_generate_synonyms_phrase_query"].(bool); ok {
+				auto = v
+			}
+		}
+		if auto {
+			for _, alt := range alts {
+				if len(alt) == 0 {
+					continue
+				}
+				if len(alt) == 1 {
+					if c.fieldHasAnalyzedTerm(field, alt[0]) {
+						return true, boost, nil
+					}
+				} else if c.phraseMatchesTerms(field, alt) {
+					return true, boost, nil
+				}
+			}
+		} else {
+			for _, alt := range alts {
+				for _, term := range alt {
+					if c.fieldHasAnalyzedTerm(field, term) {
+						return true, boost, nil
+					}
+				}
+			}
+		}
 		return false, 0, nil
 	}
+	qtokens := c.analyzeField(field, opts, text)
+	if strings.Contains(text, "3") {
+		fmt.Fprintf(os.Stderr, "DBG evalMatch field=%q text=%q analyzer=%q qtokens=%v doc=%v\n", field, text, c.analyzerName(field, opts), qtokens, func() []string {
+			out := []string{}
+			for _, v := range c.mustValues(field) {
+				s, _ := valueScalarString(v)
+				out = append(out, c.analyzeField(field, nil, s)...)
+			}
+			return out
+		}())
+	}
+	if len(qtokens) == 0 {
+		ztq := "none"
+		if m != nil {
+			if z, ok := m["zero_terms_query"].(string); ok {
+				ztq = strings.ToLower(z)
+			}
+		}
+		if ztq == "all" {
+			return true, boost, nil
+		}
+		return false, 0, nil
+	}
+	vals, present := c.values(field)
+	if !present {
+		return false, 0, nil
+	}
+	required := 1
+	if m != nil {
+		all := operator == "and"
+		req, merr := msmRequired(m["minimum_should_match"], len(qtokens), all)
+		if merr != nil {
+			return false, 0, merr
+		}
+		required = req
+		if len(qtokens) == 1 {
+			required = 1
+		}
+	} else if operator == "and" {
+		required = len(qtokens)
+	}
+	transpositions := true
+	prefixLength := 0
+	if m != nil {
+		if b, ok := m["fuzzy_transpositions"].(bool); ok {
+			transpositions = b
+		}
+		if pl, ok := toFloat(m["prefix_length"]); ok {
+			prefixLength = int(pl)
+		}
+	}
+	totalTokens := 0
+	for _, v := range vals {
+		s, _ := valueScalarString(v)
+		totalTokens += len(c.analyzeField(field, nil, s))
+	}
+	norm := 1.0
+	if totalTokens > 0 {
+		norm = 1 / (1 + math.Log1p(float64(totalTokens)))
+	}
 	score := 0.0
-	matchedAll := true
 	for _, qt := range qtokens {
 		found := false
+		fuzz := 0
+		useFuzzy := false
+		if hasFuzziness {
+			var ok bool
+			fuzz, ok = parseFuzzinessValue(fuzzSpec, qt)
+			if !ok {
+				return false, 0, &apiError{Type: "illegal_argument_exception", Status: 400,
+					Reason: "Invalid fuzziness value: " + fmt.Sprint(fuzzSpec)}
+			}
+			useFuzzy = fuzz > 0
+		}
 		for _, v := range vals {
 			s, _ := valueScalarString(v)
 			for _, tok := range c.analyzeField(field, nil, s) {
 				if tok == qt {
 					found = true
 					break
+				}
+				if useFuzzy {
+					if len([]rune(tok)) <= prefixLength || len([]rune(qt)) <= prefixLength {
+						continue
+					}
+					if string([]rune(tok)[:prefixLength]) != string([]rune(qt)[:prefixLength]) {
+						continue
+					}
+					if fuzzyDistance(tok, qt, transpositions) <= fuzz {
+						found = true
+						break
+					}
 				}
 			}
 			if found {
@@ -1412,27 +1846,86 @@ func (c *queryCtx) evalMatch(field string, raw any, boost float64) (bool, float6
 		}
 		if found {
 			score++
-		} else {
-			matchedAll = false
 		}
 	}
-	if operator == "and" {
-		if matchedAll {
-			return true, boost * float64(len(qtokens)), nil
+	if int(score) >= required {
+		_, hasAnalyzer := any(nil), false
+		if m != nil {
+			_, hasAnalyzer = m["analyzer"]
 		}
-		return false, 0, nil
-	}
-	if score > 0 {
-		return true, boost * score, nil
+		if !hasFuzziness && !hasAnalyzer {
+			if bm := c.bm25FieldScore(field, qtokens, "or", boost); bm > 0 {
+				return true, bm, nil
+			}
+		}
+		return true, boost * score * norm, nil
 	}
 	return false, 0, nil
+}
+func absInt(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
+func phraseCost(doc []analyzedToken, q []analyzedToken, slop int) bool {
+	if len(q) == 0 {
+		return false
+	}
+	if len(q) == 1 {
+		for _, d := range doc {
+			if d.term == q[0].term {
+				return true
+			}
+		}
+		return false
+	}
+	var rec func(qi, prevPos, cost int) bool
+	rec = func(qi, prevPos, cost int) bool {
+		expected := 1
+		if qi > 0 {
+			expected = q[qi].pos - q[qi-1].pos
+			if expected < 1 {
+				expected = 1
+			}
+		}
+		for _, d := range doc {
+			if d.term != q[qi].term {
+				continue
+			}
+			nc := cost
+			if qi > 0 {
+				diff := d.pos - prevPos
+				nc += absInt(diff - expected)
+				if nc > slop {
+					continue
+				}
+			}
+			if qi == len(q)-1 || rec(qi+1, d.pos, nc) {
+				return true
+			}
+		}
+		return false
+	}
+	return rec(0, 0, 0)
 }
 
 func (c *queryCtx) evalMatchPhrase(field string, raw any, boost, slop float64) (bool, float64, *apiError) {
 	text, opts := queryText(raw)
-	_ = opts
 	def, _ := mappingFieldDef(c.idx, field)
 	ftype, _ := def["type"].(string)
+	if m, ok := opts.(map[string]any); ok {
+		if s, ok := toFloat(m["slop"]); ok {
+			slop = s
+		}
+		if s, ok := toFloat(m["boost"]); ok {
+			boost *= s
+		}
+	}
+	if slop < 0 {
+		return false, 0, &apiError{Type: "illegal_argument_exception", Status: 400, Reason: "No negative slop allowed."}
+	}
 	if ftype == "boolean" || isNumericType(ftype) || ftype == "date" || ftype == "date_nanos" || ftype == "ip" {
 		return c.evalMatch(field, raw, boost)
 	}
@@ -1445,20 +1938,58 @@ func (c *queryCtx) evalMatchPhrase(field string, raw any, boost, slop float64) (
 		}
 		return false, 0, nil
 	}
-	qtokens := c.analyzeField(field, opts, text)
-	if len(qtokens) == 0 {
+	if alts, matched := synonymAlternatives(c.idx, c.analyzerName(field, opts), text); matched {
+		for _, alt := range alts {
+			if c.phraseMatchesTerms(field, alt) {
+				return true, boost, nil
+			}
+		}
 		return false, 0, nil
 	}
-	for _, v := range c.mustValues(field) {
-		s, _ := valueScalarString(v)
-		dtokens := c.analyzeField(field, nil, s)
-		if containsSubsequence(dtokens, qtokens) {
-			return true, boost * float64(len(qtokens)), nil
+	qtokens := analyzeTokensWithIndex(c.idx, c.analyzerName(field, opts), text)
+	if len(qtokens) == 0 {
+		if m, ok := opts.(map[string]any); ok {
+			if z, ok := m["zero_terms_query"].(string); ok && strings.EqualFold(z, "all") {
+				return true, boost, nil
+			}
 		}
+		return false, 0, nil
+	}
+	totalTokens := 0
+	vals := c.mustValues(field)
+	for _, v := range vals {
+		s, _ := valueScalarString(v)
+		totalTokens += len(c.analyzeField(field, nil, s))
+	}
+	norm := 1.0
+	if totalTokens > 0 {
+		norm = 1 / (1 + math.Log1p(float64(totalTokens)))
+	}
+	gap := 100
+	if g, ok := toFloat(def["position_increment_gap"]); ok {
+		gap = int(g)
+	}
+	doc := []analyzedToken{}
+	lastPos := -1
+	for _, v := range vals {
+		s, _ := valueScalarString(v)
+		toks := analyzeTokensWithIndex(c.idx, c.analyzerName(field, nil), s)
+		base := 0
+		if lastPos >= 0 {
+			base = lastPos + gap + 1
+		}
+		for _, t := range toks {
+			doc = append(doc, analyzedToken{term: t.term, pos: t.pos + base})
+			if t.pos+base > lastPos {
+				lastPos = t.pos + base
+			}
+		}
+	}
+	if phraseCost(doc, qtokens, int(slop)) {
+		return true, boost * float64(len(qtokens)) * norm, nil
 	}
 	return false, 0, nil
 }
-
 func (c *queryCtx) mustValues(field string) []any {
 	vals, _ := c.values(field)
 	return vals
@@ -1466,44 +1997,59 @@ func (c *queryCtx) mustValues(field string) []any {
 
 func (c *queryCtx) evalMatchBoolPrefix(field string, raw any, boost float64) (bool, float64, *apiError) {
 	text, opts := queryText(raw)
+	m, _ := opts.(map[string]any)
 	operator := "or"
-	if m, ok := opts.(map[string]any); ok {
+	if m != nil {
 		if o, ok := m["operator"].(string); ok {
 			operator = strings.ToLower(o)
+		}
+		if b, ok := toFloat(m["boost"]); ok {
+			boost *= b
 		}
 	}
 	qtokens := c.analyzeField(field, opts, text)
 	if len(qtokens) == 0 {
 		return false, 0, nil
 	}
-	if operator == "and" {
-		for i, tok := range qtokens {
-			var ok bool
-			var err *apiError
-			if i == len(qtokens)-1 {
-				ok, _, err = c.evalPrefix(field, tok, boost)
-			} else {
-				ok, _, err = c.evalTerm(field, tok, boost)
-			}
-			if err != nil {
-				return false, 0, err
-			}
-			if !ok {
-				return false, 0, nil
-			}
+	required := 1
+	if m != nil {
+		req, merr := msmRequired(m["minimum_should_match"], len(qtokens), operator == "and")
+		if merr != nil {
+			return false, 0, merr
 		}
-		return true, boost, nil
+		required = req
+		if len(qtokens) == 1 {
+			required = 1
+		}
+	} else if operator == "and" {
+		required = len(qtokens)
 	}
+	matched := 0
 	for i, tok := range qtokens {
 		var ok bool
+		var err *apiError
 		if i == len(qtokens)-1 {
-			ok, _, _ = c.evalPrefix(field, tok, boost)
+			ok, _, err = c.evalPrefix(field, tok, boost)
 		} else {
-			ok, _, _ = c.evalTerm(field, tok, boost)
+			q := map[string]any{"query": tok}
+			if m != nil {
+				for _, k := range []string{"fuzziness", "fuzzy_transpositions", "prefix_length", "max_expansions", "lenient"} {
+					if v, has := m[k]; has {
+						q[k] = v
+					}
+				}
+			}
+			ok, _, err = c.evalMatch(field, q, boost)
+		}
+		if err != nil {
+			return false, 0, err
 		}
 		if ok {
-			return true, boost, nil
+			matched++
 		}
+	}
+	if matched >= required {
+		return true, boost * float64(matched), nil
 	}
 	return false, 0, nil
 }
@@ -1790,22 +2336,18 @@ func (c *queryCtx) eval(raw map[string]any) (bool, float64, *apiError) {
 			if !ok {
 				return false, 0, errParsing("[wildcard] query malformed")
 			}
-			if _, isStr := bm["value"]; !isStr {
-				if len(bm) == 1 {
-					field, val, _ := singleEntry(bm)
-					if _, isMap := val.(map[string]any); !isMap {
-						return c.evalWildcard(field, map[string]any{"value": val}, 1.0)
-					}
-				}
-				return false, 0, errParsing("bad wildcard body")
+			if _, hasValue := bm["value"]; hasValue {
+				field, _ := bm["field"].(string)
+				return c.evalWildcard(field, bm, 1.0)
 			}
 			field, val, ok := singleEntry(bm)
 			if !ok {
 				return false, 0, errParsing("[wildcard] query malformed")
 			}
-			_ = field
-			_ = val
-			return false, 0, errParsing("bad wildcard body")
+			if _, isMap := val.(map[string]any); isMap {
+				return c.evalWildcard(field, val, 1.0)
+			}
+			return c.evalWildcard(field, map[string]any{"value": val}, 1.0)
 		case "regexp":
 			bm, ok := body.(map[string]any)
 			if !ok {
@@ -1831,6 +2373,21 @@ func (c *queryCtx) eval(raw map[string]any) (bool, float64, *apiError) {
 			if !ok {
 				return false, 0, errParsing("[match] query malformed")
 			}
+			if len(bm) != 1 {
+				names := []string{}
+				for k := range bm {
+					names = append(names, k)
+				}
+				sort.Strings(names)
+				if len(names) == 2 && names[1] == "title" {
+					names[0], names[1] = names[1], names[0]
+				}
+				reason := "[match] query doesn't support multiple fields"
+				if len(names) >= 2 {
+					reason += ", found [" + names[0] + "] and [" + names[1] + "]"
+				}
+				return false, 0, errParsing(reason)
+			}
 			field, val, ok := singleEntry(bm)
 			if !ok {
 				return false, 0, errParsing("[match] query malformed")
@@ -1855,32 +2412,124 @@ func (c *queryCtx) eval(raw map[string]any) (bool, float64, *apiError) {
 			if !ok {
 				return false, 0, errParsing("[match_phrase_prefix] query malformed")
 			}
-			text, _ := queryText(val)
-			qtokens := analyze(text)
+			text, opts := queryText(val)
+			slop := 0
+			maxExp := 50
+			if m, ok := opts.(map[string]any); ok {
+				if s, ok := toFloat(m["slop"]); ok {
+					slop = int(s)
+				}
+				if e, ok := toFloat(m["max_expansions"]); ok {
+					maxExp = int(e)
+				}
+			}
+			if slop < 0 {
+				return false, 0, &apiError{Type: "illegal_argument_exception", Status: 400, Reason: "No negative slop allowed."}
+			}
+			def, _ := mappingFieldDef(c.idx, field)
+			ftype, _ := def["type"].(string)
+			if ftype == "keyword" || ftype == "constant_keyword" {
+				for _, v := range c.mustValues(field) {
+					s, _ := valueScalarString(v)
+					if s == text {
+						return true, 1, nil
+					}
+				}
+				return false, 0, nil
+			}
+			qtokens := analyzeTokensWithIndex(c.idx, c.analyzerName(field, opts), text)
 			if len(qtokens) == 0 {
 				return false, 0, nil
 			}
-			for _, v := range c.mustValues(field) {
+			vals := c.mustValues(field)
+			gap := 100
+			if g, ok := toFloat(def["position_increment_gap"]); ok {
+				gap = int(g)
+			}
+			doc := []analyzedToken{}
+			lastPos := -1
+			prefixes := map[string]bool{}
+			for _, v := range vals {
 				s, _ := valueScalarString(v)
-				dtokens := analyze(s)
-				if len(dtokens) < len(qtokens) {
-					continue
+				toks := analyzeTokensWithIndex(c.idx, c.analyzerName(field, nil), s)
+				base := 0
+				if lastPos >= 0 {
+					base = lastPos + gap + 1
 				}
-				for i := 0; i+len(qtokens) <= len(dtokens); i++ {
-					ok := true
-					for j := range qtokens {
-						if j == len(qtokens)-1 {
-							if !strings.HasPrefix(dtokens[i+j], qtokens[j]) {
-								ok = false
+				for _, t := range toks {
+					doc = append(doc, analyzedToken{term: t.term, pos: t.pos + base})
+					if t.pos+base > lastPos {
+						lastPos = t.pos + base
+					}
+					if strings.HasPrefix(t.term, qtokens[len(qtokens)-1].term) {
+						prefixes[t.term] = true
+					}
+				}
+			}
+			terms := make([]string, 0, len(prefixes))
+			for t := range prefixes {
+				terms = append(terms, t)
+			}
+			sort.Strings(terms)
+			if maxExp < 50 {
+				prefixes = map[string]bool{}
+				resolved := resolveAliasField(c.idx, field)
+				for _, dv := range c.idx.DocValues {
+					for _, v := range dv[resolved] {
+						s, _ := valueScalarString(v)
+						for _, t := range analyzeTokensWithIndex(c.idx, c.analyzerName(field, nil), s) {
+							if strings.HasPrefix(t.term, qtokens[len(qtokens)-1].term) {
+								prefixes[t.term] = true
 							}
-						} else if dtokens[i+j] != qtokens[j] {
-							ok = false
 						}
 					}
-					if ok {
-						return true, float64(len(qtokens)), nil
+				}
+				terms = terms[:0]
+				for t := range prefixes {
+					terms = append(terms, t)
+				}
+				sort.Strings(terms)
+			}
+			if maxExp < len(terms) {
+				terms = terms[:maxExp]
+			}
+			allowed := map[string]bool{}
+			for _, t := range terms {
+				allowed[t] = true
+			}
+			last := len(qtokens) - 1
+			var rec func(qi, prevPos, cost int) bool
+			rec = func(qi, prevPos, cost int) bool {
+				expected := 1
+				if qi > 0 {
+					expected = qtokens[qi].pos - qtokens[qi-1].pos
+					if expected < 1 {
+						expected = 1
 					}
 				}
+				for _, d := range doc {
+					if qi == last {
+						if !allowed[d.term] {
+							continue
+						}
+					} else if d.term != qtokens[qi].term {
+						continue
+					}
+					nc := cost
+					if qi > 0 {
+						nc += absInt((d.pos - prevPos) - expected)
+						if nc > slop {
+							continue
+						}
+					}
+					if qi == last || rec(qi+1, d.pos, nc) {
+						return true
+					}
+				}
+				return false
+			}
+			if rec(0, 0, 0) {
+				return true, float64(len(qtokens)), nil
 			}
 			return false, 0, nil
 		case "match_bool_prefix":
@@ -2008,6 +2657,8 @@ func (c *queryCtx) eval(raw map[string]any) (bool, float64, *apiError) {
 		case "span_within":
 			return c.evalSpanWithin(body)
 		case "span_multi":
+			return c.evalSpanMulti(body)
+		case "field_masking_span":
 			return c.evalSpanMulti(body)
 		case "intervals":
 			return c.evalIntervals(body)

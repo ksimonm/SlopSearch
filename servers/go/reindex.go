@@ -263,8 +263,26 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 			created++
 			destIdx.Order = append(destIdx.Order, id)
 		}
+		pparams := map[string]any{}
+		if pn, ok := destRaw["pipeline"].(string); ok && pn != "" {
+			pparams["pipeline"] = pn
+		}
+		doc, apiErr = s.applyPipelines(destIdx, doc, pparams)
+		if apiErr != nil {
+			if existing {
+				updated--
+			} else {
+				created--
+				if len(destIdx.Order) > 0 {
+					destIdx.Order = destIdx.Order[:len(destIdx.Order)-1]
+				}
+			}
+			failures = append(failures, reindexFailure{index: destName, id: id,
+				typ: apiErr.Type, rex: apiErr.Reason, code: apiErr.Status}.json(destUUID))
+			continue
+		}
 		props := ensureProperties(destIdx.Mappings)
-		mergeMapping(props, doc)
+		mergeMappingForIndex(destIdx, props, doc)
 		destIdx.FieldTypes = map[string]string{}
 		buildFieldTypes(destIdx.Mappings, "", destIdx.FieldTypes)
 		if derr := destIdx.computeDocValues(id, doc); derr != nil {
