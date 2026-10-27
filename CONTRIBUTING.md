@@ -34,42 +34,50 @@ how they behave.
 
 Much of SlopenSearch is written with AI coding agents, and you are welcome to use one.
 The suite keeps the work honest, as long as the agent follows the same rules as everyone
-else. Start the agent in the repository root and adapt this prompt: pick the server, the
-test file and, optionally, a narrower `-k` expression.
+else. Start the agent in the repository root, pick a server and a test file, and replace
+`<server>` (`go` or `rust`) and `<file>` in the prompt below. Where the work is now:
+
+| Server | Open test files |
+|---|---|
+| Go | `test_32_queries`, `test_71_field_types`, `test_43_scripting`, `test_51_analysis`, `test_80_languages` |
+| Rust | `test_43_scripting`, `test_51_analysis`, `test_80_languages` |
+
+`make <server>-score` shows the current numbers.
 
 ```text
 You are working on SlopenSearch, a server that must answer the OpenSearch 3.9 REST API
-exactly like OpenSearch does. Read README.md, CONTRIBUTING.md and servers/rust/README.md
-first.
+exactly like OpenSearch does. Read README.md, CONTRIBUTING.md and
+servers/<server>/README.md first.
 
-Task: make more tests in tests/test_51_analysis.py pass against the Rust server.
+Task: make more tests in tests/<file>.py pass against the <server> server.
 
 How to work:
-1. Run `make rust-score` once and note the pass rate of every test file.
-2. Run `make rust-test ARGS=tests/test_51_analysis.py` and group the failures by cause.
+1. Run `make <server>-score` once and note the pass rate of every test file.
+2. Run `make <server>-test ARGS=tests/<file>.py` and group the failures by cause.
    Pick the group that unblocks the most tests and fix it, then the next one.
 3. When it is unclear what OpenSearch answers, ask the reference: run `make ref-up`
    and `curl localhost:9290/...`. Match its status code, error type, key names and key
    order exactly.
-4. Iterate with `make rust-test ARGS="tests/test_51_analysis.py -k <expr>"`.
-5. At the end, run `make rust-score` again and compare with step 1. No other file may
+4. Iterate with `make <server>-test ARGS="tests/<file>.py -k <expr>"`.
+5. At the end, run `make <server>-score` again and compare with step 1. No other file may
    lose passing tests.
 
 Hard rules:
 - Never edit anything in tests/. If you believe a test is wrong, stop and tell me which
   test and why, with the reference answer from `make ref-test ARGS=<test>`.
-- Only change files in servers/rust/.
-- No new dependencies without asking me.
+- Only change files in servers/<server>/.
+- No new dependencies without asking me (the Go server uses the standard library only).
 - Don't special-case test index names or test inputs; implement the real behaviour.
 
 Finish with a short report: which behaviours you implemented, the pass rate of
-test_51_analysis.py before and after, the total before and after, and anything you
+<file>.py before and after, the total before and after, and anything you
 left unfinished.
 ```
 
-For the Go server, replace `rust` with `go` in the commands and `servers/rust/` with
-`servers/go/` (standard library only, no dependencies at all). Before opening a pull
-request, read the diff yourself: you are the author, not the agent.
+When one server already passes a file the other one doesn't, you can add to the prompt:
+"servers/<other>/ already passes this file; read it as a reference for the behaviour, but
+write idiomatic code for this server." Before opening a pull request, read the diff
+yourself: you are the author, not the agent.
 
 ## Adding or fixing a test
 
@@ -95,5 +103,5 @@ answers. A failing test in a pull request is even better.
 ## Pull requests
 
 Keep them focused on one area, describe what changed in the pass rate (`make go-score` /
-`make rust-score` before and after). By contributing you agree that your contribution is licensed under the
-[Apache License 2.0](LICENSE).
+`make rust-score` before and after). By contributing you agree that your contribution is
+licensed under the [Apache License 2.0](LICENSE).
